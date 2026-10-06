@@ -117,9 +117,13 @@ such a job when all of the following hold on every resource dimension it request
   preemptable running pods. When `ancestorReclaimLevel` is greater than 0, intermediate queues outside the
   asker's own branch are also capped by their usage above `deserved`.
 
-Jobs admitted this way are then served by the `reclaim` action in the same or a following session. The
-gang plugin's `minAvailable` veto on victims is not modeled by this check, so with gang `reclaimable`
-enabled a job may be admitted whose last victim gang refuses to evict.
+Jobs admitted this way are then served by the `reclaim` action in the same or a following session, so
+`reclaim` must be in the `actions` list (the default configuration does not include it); without it an
+admitted job stays `Inqueue` and keeps its `inqueue` reservation. Other plugins with `enableJobEnqueued`
+still vote: a `Reject` from any of them (for example `overcommit` on a fully allocated cluster) wins over
+this admission. The gang plugin's `minAvailable` veto on victims is not modeled by this check, so with
+gang `reclaimable` enabled a job may be admitted whose last victim gang refuses to evict.
+
 ## Choose the cheapest victims across nodes
 
 The `reclaim` action evicts on one node per task. By default it commits on the first candidate node
