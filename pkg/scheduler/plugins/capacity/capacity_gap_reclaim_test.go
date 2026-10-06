@@ -73,6 +73,9 @@ type gapCase struct {
 	priority bool
 	// enable gang's ReclaimableFn (the minAvailable veto). Off by default, as in the baseline tiers.
 	gangReclaim bool
+	// take JobStarving from the priority plugin (any unplaced task) instead of gang
+	// (ready+pipelined < minAvailable). Implies priority.
+	starvingByPending bool
 	// non-empty: t.Skip with this reason (EXPECT-FAIL).
 	skip string
 }
@@ -130,8 +133,9 @@ func (tr gapTree) queues() []*schedulingv1beta1.Queue {
 	}
 }
 
-func gapTiers(level int, withPriority, gangReclaim bool) []conf.Tier {
+func gapTiers(level int, withPriority, gangReclaim, starvingByPending bool) []conf.Tier {
 	trueValue := true
+	withPriority = withPriority || starvingByPending
 	capacityOpt := conf.PluginOption{
 		Name:               PluginName,
 		EnabledAllocatable: &trueValue,
@@ -148,17 +152,26 @@ func gapTiers(level int, withPriority, gangReclaim bool) []conf.Tier {
 	if gangReclaim {
 		gangOpt.EnabledReclaimable = &trueValue
 	}
+	if starvingByPending {
+		// ssn.JobStarving ANDs every plugin with the flag on, so gang's must be off for the
+		// priority plugin's definition to take effect.
+		gangOpt.EnabledJobStarving = nil
+	}
 	plugins := []conf.PluginOption{
 		capacityOpt,
 		{Name: predicates.PluginName, EnabledPredicate: &trueValue},
 		gangOpt,
 	}
 	if withPriority {
-		plugins = append(plugins, conf.PluginOption{
+		prioOpt := conf.PluginOption{
 			Name:             priority.PluginName,
 			EnabledJobOrder:  &trueValue,
 			EnabledTaskOrder: &trueValue,
-		})
+		}
+		if starvingByPending {
+			prioOpt.EnabledJobStarving = &trueValue
+		}
+		plugins = append(plugins, prioOpt)
 	}
 	return []conf.Tier{{Plugins: plugins}}
 }
@@ -617,8 +630,10 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			// gap. Actual: reclaim only serves starving jobs (gang's JobStarvingFn, i.e.
 			// ready+pipelined < minAvailable), and a minMember-1 PodGroup with a running driver is
 			// not starving, so its later executors are never reclaim askers; they wait for free
-			// capacity. D2b shows the workaround (executor in its own PodGroup).
-			skip: "EXPECT-FAIL: reclaim skips jobs that already satisfy minAvailable, so executors joining a running minMember-1 PodGroup never trigger reclaim",
+			// capacity. In a failover on a fully allocated cluster that means the standby never
+			// ramps. D2b shows a PodGroup-shape workaround (executor in its own PodGroup) and D2c
+			// the configuration one (jobStarving from the priority plugin instead of gang).
+			skip: "EXPECT-FAIL with gang's jobStarving: reclaim skips jobs that already satisfy minAvailable, so executors joining a running minMember-1 PodGroup never trigger reclaim (see D2b, D2c)",
 			TestCommonStruct: uthelper.TestCommonStruct{
 				Name:    "D2: executor arriving after the driver in the same PodGroup reclaims the remaining gap",
 				Plugins: plugins,
@@ -650,6 +665,29 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, gapRunningPG("pg-standby", "standby"), gapAskPG("pg-standby-exec", "standby")},
 				Queues:          gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
 				ExpectPipeLined: map[string][]string{"ns1/pg-standby-exec": {"n1"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-2"},
+			},
+		},
+		{
+			// Documenting. The D2 fixture again, with JobStarving taken from the priority plugin
+			// ("any task not yet ready or pipelined") instead of gang ("ready+pipelined <
+			// minAvailable"). The executor joining the running minMember-1 PodGroup now makes the
+			// job a reclaim asker and the remaining gap is reclaimed. This is the configuration
+			// answer to D2 for driver+executor PodGroups with minAvailable 1.
+			starvingByPending: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "D2c: with jobStarving from the priority plugin, an executor joining a running minMember-1 PodGroup reclaims the remaining gap",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("standby-driver", "pg-standby", "2", true),
+					gapPendingPod("exec-s1", "pg-standby", "2"),
+					gapRunningPod("exec-2", "pg-active", "2", true),
+				},
+				Nodes:           []*corev1.Node{n1},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, gapRunningPG("pg-standby", "standby")},
+				Queues:          gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
 				ExpectEvictNum:  1,
 				ExpectEvicted:   []string{"ns1/exec-2"},
 			},
@@ -891,7 +929,7 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
 			}
-			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim), nil)
+			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending), nil)
 			defer c.Close()
 			c.Run(actions)
 			if err := c.CheckAll(i); err != nil {
