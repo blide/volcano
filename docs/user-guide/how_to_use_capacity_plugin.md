@@ -87,10 +87,39 @@ data:
           # 1: adds parent-level deserved checks for cross-parent reclaim
           # 2: adds grandparent-level deserved checks, and so on for larger levels
           ancestorReclaimLevel: 1
+          # Admit a job at enqueue when its only blocker is an ancestor queue's capability that
+          # reclaim can free. Default false. See "Configure enqueue admission on reclaimable
+          # ancestor capacity" below.
+          enqueueAncestorCapReclaim: true
       - name: nodeorder
       - name: binpack
 ```
 
+## Configure enqueue admission on reclaimable ancestor capacity
+
+By default a PodGroup with `minResources` is only enqueued when `minResources + allocated + inqueue - elastic`
+fits the `capability` of its queue and of every ancestor. The `elastic` term is the usage of running jobs
+above their own `minResources`, so holders whose `minResources` equal their usage (for example PodGroups
+auto-created per pod) contribute no elastic credit. In a hierarchy where a parent carries a `capability`,
+an under-deserved child can then be rejected at enqueue even though the `reclaim` action would evict an
+over-deserved sibling for it. The job stays Pending and reclaim never sees it (see
+[volcano-sh/volcano#4817](https://github.com/volcano-sh/volcano/issues/4817)).
+
+Setting the plugin argument `enqueueAncestorCapReclaim: true` (hierarchy mode only, default `false`) admits
+such a job when all of the following hold on every resource dimension it requests:
+
+- the leaf queue passes its own enqueue check unchanged (the leaf `capability` is never relaxed);
+- after admission the leaf stays at or under its `deserved`: `allocated + inqueue + minResources <= deserved`,
+  with no elastic credit, and a requested dimension missing from `deserved` counts as zero;
+- every ancestor that fails its check fails only on `capability`, and the reclaimable slack in its subtree
+  covers the shortfall. Slack is summed over leaf queues that are open and reclaimable, excluding the asker,
+  and per leaf is the minimum of usage above `deserved`, usage above `guarantee`, and the requests of
+  preemptable running pods. When `ancestorReclaimLevel` is greater than 0, intermediate queues outside the
+  asker's own branch are also capped by their usage above `deserved`.
+
+Jobs admitted this way are then served by the `reclaim` action in the same or a following session. The
+gang plugin's `minAvailable` veto on victims is not modeled by this check, so with gang `reclaimable`
+enabled a job may be admitted whose last victim gang refuses to evict.
 ## Choose the cheapest victims across nodes
 
 The `reclaim` action evicts on one node per task. By default it commits on the first candidate node

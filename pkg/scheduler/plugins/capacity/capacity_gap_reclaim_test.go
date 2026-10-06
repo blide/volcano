@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 
+	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
@@ -76,6 +77,8 @@ type gapCase struct {
 	// take JobStarving from the priority plugin (any unplaced task) instead of gang
 	// (ready+pipelined < minAvailable). Implies priority.
 	starvingByPending bool
+	// enable the capacity plugin's enqueueAncestorCapReclaim argument (enqueue-side admission).
+	enqueueReclaim bool
 	// non-empty: t.Skip with this reason (EXPECT-FAIL).
 	skip string
 }
@@ -133,7 +136,7 @@ func (tr gapTree) queues() []*schedulingv1beta1.Queue {
 	}
 }
 
-func gapTiers(level int, withPriority, gangReclaim, starvingByPending bool) []conf.Tier {
+func gapTiers(level int, withPriority, gangReclaim, starvingByPending, enqueueReclaim bool) []conf.Tier {
 	trueValue := true
 	withPriority = withPriority || starvingByPending
 	capacityOpt := conf.PluginOption{
@@ -145,8 +148,14 @@ func gapTiers(level int, withPriority, gangReclaim, starvingByPending bool) []co
 		EnabledHierarchy:   &trueValue,
 		EnabledJobEnqueued: &trueValue,
 	}
-	if level > 0 {
-		capacityOpt.Arguments = framework.Arguments{ancestorReclaimLevelKey: level}
+	if level > 0 || enqueueReclaim {
+		capacityOpt.Arguments = framework.Arguments{}
+		if level > 0 {
+			capacityOpt.Arguments[ancestorReclaimLevelKey] = level
+		}
+		if enqueueReclaim {
+			capacityOpt.Arguments[enqueueAncestorCapReclaimKey] = true
+		}
 	}
 	gangOpt := conf.PluginOption{Name: gang.PluginName, EnabledJobStarving: &trueValue}
 	if gangReclaim {
@@ -248,6 +257,44 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	// PodGroup per holder pod, minMember 1, minResources equal to that pod's request.
 	pgExec1MinRes := util.BuildPodGroupWithMinResources("pg-exec-1", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 	pgExec2MinRes := util.BuildPodGroupWithMinResources("pg-exec-2", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
+	pgProberMinRes := util.BuildPodGroupWithMinResources("pg-prober", gapNS, "infra", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
+	pgStandbyMinRes4 := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+	// G9: a cpu+gpu ask. Only cpu has reclaimable slack under the tenant.
+	gpu := func(c, g string) corev1.ResourceList {
+		return api.BuildResourceList(c, c+"Gi", []api.ScalarResource{{Name: "nvidia.com/gpu", Value: g}}...)
+	}
+	gpuNode := util.BuildNode("n1", api.BuildResourceList("8", "8Gi", []api.ScalarResource{{Name: "pods", Value: "10"}, {Name: "nvidia.com/gpu", Value: "4"}}...), map[string]string{})
+	gpuQueues := []*schedulingv1beta1.Queue{
+		gapQueue("root", "", "", ""),
+		buildQueueWithParents("tenant", "root", gpu("4", "1"), gpu("4", "1")),
+		buildQueueWithParents("active", "tenant", gpu("2", "1"), gpu("4", "1")),
+		buildQueueWithParents("standby", "tenant", gpu("2", "1"), gpu("4", "1")),
+	}
+	pgExec1Gpu := util.BuildPodGroupWithMinResources("pg-exec-1", gapNS, "active", 1, nil, gpu("2", "1"), schedulingv1beta1.PodGroupRunning)
+	pgStandbyGpu := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, gpu("2", "1"), schedulingv1beta1.PodGroupPending)
+	// G10: slack spread over two sibling queues.
+	//
+	//	tenant   deserved 6c, cap 6c
+	//	├── a        deserved 1c, cap 6c   holds exec-a1 2c (preemptable) + exec-a2 1c (protected)
+	//	├── b        deserved 1c, cap 6c   holds exec-b1 2c (preemptable) + exec-b2 1c (protected)
+	//	└── standby  deserved 4c, cap 6c   asks 4c
+	//	node n1: 8c, 2c free
+	twoSiblingQueues := []*schedulingv1beta1.Queue{
+		gapQueue("root", "", "", ""),
+		gapQueue("tenant", "root", "6", "6"),
+		gapQueue("a", "tenant", "1", "6"),
+		gapQueue("b", "tenant", "1", "6"),
+		gapQueue("standby", "tenant", "4", "6"),
+	}
+	twoSiblingPGs := []*schedulingv1beta1.PodGroup{
+		util.BuildPodGroupWithMinResources("pg-a1", gapNS, "a", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning),
+		util.BuildPodGroupWithMinResources("pg-a2", gapNS, "a", 1, nil, cpuMem("1"), schedulingv1beta1.PodGroupRunning),
+		util.BuildPodGroupWithMinResources("pg-b1", gapNS, "b", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning),
+		util.BuildPodGroupWithMinResources("pg-b2", gapNS, "b", 1, nil, cpuMem("1"), schedulingv1beta1.PodGroupRunning),
+		pgStandbyMinRes4,
+	}
+	// G7: the standby leaf's deserved is short on memory only.
+	standbyShortMemory := buildQueueWithParents("standby", "tenant", api.BuildResourceList("2", "1Gi"), cpuMem("4"))
 
 	cases := []gapCase{
 		// ---------------------------------------------------------------- A. capacity-gap reclaim
@@ -906,16 +953,14 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			},
 		},
 		{
-			// EXPECT-FAIL. Same as G1 but the holder also declares minResources (4c, vcjob
-			// style), so nothing is elastic: capacity's jobEnqueueable sees the tenant at cap,
-			// the PodGroup stays Pending and reclaim never sees the job. Desired: enqueued, then
-			// reclaimed as in A1. This needs the enqueue-side follow-up (permit only when the leaf
-			// is under deserved on every requested dimension and the only failing check is an
-			// ancestor cap; strictly all-dimension, unlike volcano-sh/volcano#4825). See
-			// volcano-sh/volcano#4817.
-			skip: "EXPECT-FAIL: enqueue gate rejects a minResources PodGroup blocked only by an ancestor cap when the holders have no elastic usage (volcano-sh/volcano#4817, follow-up to the reclaim fix)",
+			// Requirement. Same as G1 but the holder also declares minResources (4c, vcjob
+			// style), so nothing is elastic and the default gate rejects the ask at the tenant.
+			// With enqueueAncestorCapReclaim the gate sees that the leaf stays under deserved and
+			// that active's reclaimable slack (exec-1, 2c over deserved) covers the 2c shortfall,
+			// admits the job, and reclaim serves it as in A1.
+			enqueueReclaim: true,
 			TestCommonStruct: uthelper.TestCommonStruct{
-				Name:            "G2: an ask with minResources blocked by an ancestor cap held by non-elastic jobs should be enqueued and then reclaimed",
+				Name:            "G2: an ask with minResources blocked by an ancestor cap held by non-elastic jobs is enqueued on reclaimable slack and then reclaimed",
 				Plugins:         plugins,
 				Pods:            []*corev1.Pod{exec1, exec2Protected, ask},
 				Nodes:           []*corev1.Node{n1},
@@ -927,15 +972,14 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			},
 		},
 		{
-			// EXPECT-FAIL. The pod == PodGroup shape: every pod runs without a pre-created
+			// Requirement. The pod == PodGroup shape: every pod runs without a pre-created
 			// PodGroup, so the controller gives each one a minMember-1 PodGroup whose
-			// minResources equal the pod's own request. A single-pod PodGroup therefore has no
-			// elastic usage, and a failover ask (itself carrying minResources) is rejected at
-			// enqueue as in G2 even though reclaim could serve it. For this shape the reclaim fix
-			// alone is not enough; the enqueue-side follow-up is required.
-			skip: "EXPECT-FAIL: with pod == PodGroup every holder carries minResources equal to its usage, so the enqueue gate rejects a failover ask blocked only by an ancestor cap (volcano-sh/volcano#4817, follow-up)",
+			// minResources equal the pod's own request. A single-pod PodGroup has no elastic
+			// usage, so by default a failover ask is rejected at enqueue even though reclaim could
+			// serve it (see G3-off). With enqueueAncestorCapReclaim it is admitted and reclaimed.
+			enqueueReclaim: true,
 			TestCommonStruct: uthelper.TestCommonStruct{
-				Name:    "G3: pod == PodGroup shape, failover ask blocked at enqueue by an ancestor cap should be enqueued and then reclaimed",
+				Name:    "G3: pod == PodGroup shape, failover ask blocked at enqueue by an ancestor cap is enqueued on reclaimable slack and then reclaimed",
 				Plugins: plugins,
 				Pods: []*corev1.Pod{
 					gapRunningPod("exec-1", "pg-exec-1", "2", true),
@@ -950,6 +994,183 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvicted:   []string{"ns1/exec-1"},
 			},
 		},
+		{
+			// Documenting. G3 with the flag off: the default gate is unchanged, the PodGroup stays
+			// Pending and nothing is evicted.
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G3-off: pod == PodGroup shape without enqueueAncestorCapReclaim stays Pending",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					ask,
+				},
+				Nodes:          []*corev1.Node{n1},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes},
+				Queues:         defaultGapTree.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, but every holder is non-preemptable: no reclaimable slack, so
+			// the ask is not admitted. This is the "admitted but never served" case the gate must
+			// not produce.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G4: no admission when the holders are non-preemptable",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", false),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					ask,
+				},
+				Nodes:          []*corev1.Node{n1},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes},
+				Queues:         defaultGapTree.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, but the holder queue has reclaimable=false: its usage is not
+			// slack.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G5: no admission when the holder queue is not reclaimable",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					ask,
+				},
+				Nodes:     []*corev1.Node{n1},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("tenant", "root", "4", "4"),
+					activeNotReclaimable,
+					gapQueue("standby", "tenant", "2", "4"),
+				},
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, but the holders sit exactly at their deserved (active 2c of
+			// 2c, infra 2c of 2c): reclaim would find no victim, so nothing is admitted. The
+			// children's deserved sum exceeds the tenant's here; that misconfiguration is exactly
+			// when a deserved-only rule would admit a hopeless job.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G6: no admission when the holders are at their deserved",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("prober", "pg-prober", "2", true),
+					ask,
+				},
+				Nodes:     []*corev1.Node{n1},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgProberMinRes, pgStandbyMinRes},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("tenant", "root", "4", "4"),
+					gapQueue("active", "tenant", "2", "4"),
+					gapQueue("infra", "tenant", "2", "4"),
+					gapQueue("standby", "tenant", "2", "4"),
+				},
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, cpu slack exists, but the ask would take the leaf over its
+			// deserved on memory (deserved 1Gi, ask 2Gi). The rule is all-dimension: not admitted.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G7: no admission when the leaf would exceed deserved on any requested dimension",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					ask,
+				},
+				Nodes:     []*corev1.Node{n1},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("tenant", "root", "4", "4"),
+					gapQueue("active", "tenant", "2", "4"),
+					standbyShortMemory,
+				},
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, but the 4c ask's shortfall exceeds the 2c of reclaimable
+			// slack (only exec-1 is preemptable): not admitted, so no half-useful eviction can
+			// follow either.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G8: no admission when the shortfall exceeds the reclaimable slack",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:          []*corev1.Node{n1},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues:         gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, two-dimension ask (cpu + gpu). active is over deserved on cpu
+			// only (4c of 2c; 1 gpu of 1 gpu), so the tenant's gpu shortfall has no slack behind
+			// it. The rule is all-dimension: not admitted.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G9: no admission when only some requested dimensions have reclaimable slack",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					util.BuildPod(gapNS, "exec-1", "n1", corev1.PodRunning, gpu("2", "1"), "pg-exec-1", preemptableLabel(true), map[string]string{}),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					util.BuildPod(gapNS, "standby-driver", "", corev1.PodPending, gpu("2", "1"), "pg-standby", map[string]string{}, map[string]string{}),
+				},
+				Nodes:          []*corev1.Node{gpuNode},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1Gpu, pgExec2MinRes, pgStandbyGpu},
+				Queues:         gpuQueues,
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Flag on, the 4c shortfall is covered only by adding the slack of two
+			// sibling queues (2c each). Admitted, then reclaim evicts one pod from each sibling
+			// and pipelines the ask.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G10: admission on slack spread over two sibling queues, then reclaim from both",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-a1", "pg-a1", "2", true),
+					gapRunningPod("exec-a2", "pg-a2", "1", false),
+					gapRunningPod("exec-b1", "pg-b1", "2", true),
+					gapRunningPod("exec-b2", "pg-b2", "1", false),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:           []*corev1.Node{n1},
+				PodGroups:       twoSiblingPGs,
+				Queues:          twoSiblingQueues,
+				ExpectStatus:    map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupInqueue},
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
+				ExpectEvictNum:  2,
+				ExpectEvicted:   []string{"ns1/exec-a1", "ns1/exec-b1"},
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -957,11 +1178,33 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
 			}
-			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending), nil)
+			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), nil)
 			defer c.Close()
 			c.Run(actions)
 			if err := c.CheckAll(i); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func Test_capacityPlugin_parseEnqueueAncestorCapReclaim(t *testing.T) {
+	cases := []struct {
+		name string
+		args framework.Arguments
+		want bool
+	}{
+		{name: "default off", args: framework.Arguments{}, want: false},
+		{name: "enabled", args: framework.Arguments{enqueueAncestorCapReclaimKey: true}, want: true},
+		{name: "explicitly off", args: framework.Arguments{enqueueAncestorCapReclaimKey: false}, want: false},
+		{name: "invalid value falls back to off", args: framework.Arguments{enqueueAncestorCapReclaimKey: "nope"}, want: false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cp := New(c.args).(*capacityPlugin)
+			cp.parseArguments()
+			if cp.enqueueAncestorCapReclaim != c.want {
+				t.Fatalf("%s=%v: want %t, got %t", enqueueAncestorCapReclaimKey, c.args[enqueueAncestorCapReclaimKey], c.want, cp.enqueueAncestorCapReclaim)
 			}
 		})
 	}

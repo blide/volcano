@@ -155,6 +155,43 @@ In reclaim when hierarchy is enabled, victims are processed by `BuildVictimsPrio
 
 This allows operators to tighten reclaim boundaries in larger queue trees while preserving default behavior when no restriction is required.
 
+### Enqueue admission on reclaimable ancestor capacity
+
+The enqueue gate (`jobEnqueueable`, checked for the leaf and every ancestor by
+`checkJobEnqueueableHierarchically`) models what can be freed with the `elastic` term only: a running job's
+usage above its own `minResources`. Reclaim decides victims by a different model: a leaf's usage above its
+`deserved`, filtered by the preemptable flag, `reclaimable`, the `guarantee` floor and gang. The two
+disagree when a parent carries a `capability`, the holders have no elastic usage (PodGroups whose
+`minResources` equal their usage, as the PodGroup controller creates them for bare pods), and an
+under-deserved sibling asks: the gate rejects the job at the parent, the PodGroup stays Pending, and the
+`reclaim` action skips Pending jobs. This is the enqueue-side form of
+[volcano-sh/volcano#4817](https://github.com/volcano-sh/volcano/issues/4817); the reclaim-side form is
+handled in the `reclaim` action's stop condition (`reclaimerFitsOnNode` includes `ssn.Allocatable`).
+
+With plugin argument `enqueueAncestorCapReclaim: true` (hierarchy mode only, default `false`), a job that
+fails the gate is admitted by `enqueueableViaAncestorReclaim` only when, on every requested dimension:
+
+1. the leaf passes its own check unchanged;
+2. the leaf stays at or under its `deserved` after admission, without elastic credit (a requested dimension
+   missing from `deserved` counts as zero);
+3. every failing ancestor fails on `realCapability` only (a DRA failure still rejects) and
+   `reclaimableSlackUnder` covers the shortfall `minResources + allocated + inqueue - elastic - realCapability`.
+
+`reclaimableSlackUnder` sums, over open and reclaimable leaf queues in the ancestor's subtree other than the
+asker, the per-dimension minimum of usage above `deserved`, usage above `guarantee` and preemptable running
+requests; intermediate queues outside the asker's branch are additionally capped by their usage above
+`deserved` when `ancestorReclaimLevel > 0`, mirroring the ancestor checks in `ReclaimableFn`. The rule is
+strictly all-dimension and never relaxes the leaf's own capability, in contrast to the approach in
+[volcano-sh/volcano#4825](https://github.com/volcano-sh/volcano/pull/4825), which admitted on any single
+dimension below `deserved` or `guarantee` and skipped the capability checks. `inqueue` accounting
+(`JobEnqueuedFn`) is unchanged, so several asks admitted in one session see each other's reservations.
+Gang's `minAvailable` veto on victims is not modeled.
+
+The table-driven test `Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation` (section G) covers the
+default rejection, admission with reclaim in the same session, and the negative cases: non-preemptable
+holders, `reclaimable: false`, holders at `deserved`, a leaf over `deserved` on one dimension, a shortfall
+above the slack, and a multi-dimension ask with slack on one dimension only.
+
 #### Unit test scenarios and behavior map
 
 The table-driven test `Test_capacityPlugin_AncestorReclaimScenarios` covers case1-case11 with explicit topologies and reclaim outcomes.
