@@ -296,6 +296,57 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	// G7: the standby leaf's deserved is short on memory only.
 	standbyShortMemory := buildQueueWithParents("standby", "tenant", api.BuildResourceList("2", "1Gi"), cpuMem("4"))
 
+	withGuarantee := func(q *schedulingv1beta1.Queue, c string) *schedulingv1beta1.Queue {
+		q.Spec.Guarantee = schedulingv1beta1.Guarantee{Resource: cpuMem(c)}
+		return q
+	}
+	// fiveHolders builds five 2c running pods in queue, each in its own PodGroup with
+	// minResources equal to its request (the pod == PodGroup shape).
+	fiveHolders := func(prefix, queue string) ([]*corev1.Pod, []*schedulingv1beta1.PodGroup) {
+		var pods []*corev1.Pod
+		var pgs []*schedulingv1beta1.PodGroup
+		for i := 1; i <= 5; i++ {
+			pg := prefix + "-pg-" + strconv.Itoa(i)
+			pods = append(pods, gapRunningPod(prefix+"-"+strconv.Itoa(i), pg, "2", true))
+			pgs = append(pgs, util.BuildPodGroupWithMinResources(pg, gapNS, queue, 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning))
+		}
+		return pods, pgs
+	}
+	// G11: the scenario reported in volcano-sh/volcano#4817, scaled to a 10c node. The root
+	// capability is set explicitly: the reporter hit this on 1.13, where the root's realCapability
+	// was the cluster total; on master an unset root capability is infinite, so the same block
+	// now needs a capability on the root or on an intermediate ancestor.
+	//
+	//	root        capability 10c
+	//	├── org-1   no guarantee, no deserved
+	//	│   └── org-1-team-1  capability 10c, no deserved   holds 10c (5 × 2c)
+	//	└── org-2   guarantee 4c
+	//	    └── org-2-team-1  guarantee 4c, deserved 4c       asks 4c
+	issueQueues := []*schedulingv1beta1.Queue{
+		gapQueue("root", "", "", "10"),
+		gapQueue("org-1", "root", "", ""),
+		gapQueue("org-1-team-1", "org-1", "", "10"),
+		withGuarantee(gapQueue("org-2", "root", "", ""), "4"),
+		withGuarantee(gapQueue("org-2-team-1", "org-2", "4", ""), "4"),
+	}
+	org1Pods, org1PGs := fiveHolders("org1", "org-1-team-1")
+	pgOrg2Ask := util.BuildPodGroupWithMinResources("pg-org2", gapNS, "org-2-team-1", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+	// G12: the example from volcano-sh/volcano#4825, scaled to a 10c node. leaf-1 holds more
+	// than its effective capability (6c), the state that arises when leaf-2 is created after
+	// leaf-1 already borrowed the whole parent.
+	//
+	//	parent      guarantee 10c, capability 10c
+	//	├── leaf-1  guarantee 6c, deserved 6c   holds 10c (5 × 2c)
+	//	└── leaf-2  guarantee 4c, deserved 4c   asks 4c
+	prExampleQueues := []*schedulingv1beta1.Queue{
+		gapQueue("root", "", "", ""),
+		withGuarantee(gapQueue("parent", "root", "", "10"), "10"),
+		withGuarantee(gapQueue("leaf-1", "parent", "6", ""), "6"),
+		withGuarantee(gapQueue("leaf-2", "parent", "4", ""), "4"),
+	}
+	leaf1Pods, leaf1PGs := fiveHolders("l1", "leaf-1")
+	pgLeaf2Ask := util.BuildPodGroupWithMinResources("pg-leaf-2", gapNS, "leaf-2", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+
 	cases := []gapCase{
 		// ---------------------------------------------------------------- A. capacity-gap reclaim
 		{
@@ -1169,6 +1220,45 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
 				ExpectEvictNum:  2,
 				ExpectEvicted:   []string{"ns1/exec-a1", "ns1/exec-b1"},
+			},
+		},
+		{
+			// Requirement. The reporter's scenario from volcano-sh/volcano#4817: org-2-team-1 has a
+			// 4c guarantee, org-1-team-1 borrowed the whole cluster with no deserved at all, and
+			// the ask is blocked at the root. With the flag the root's shortfall (4c) is covered by
+			// org-1-team-1's slack (10c, all of it over its empty deserved), the job is admitted,
+			// and reclaim evicts two 2c pods.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:            "G11: issue 4817 scenario, guaranteed child blocked at the root by a borrower with no deserved",
+				Plugins:         plugins,
+				Pods:            append(append([]*corev1.Pod{}, org1Pods...), gapPendingPod("team2-driver", "pg-org2", "4")),
+				Nodes:           []*corev1.Node{gapNode("n1", "10")},
+				PodGroups:       append(append([]*schedulingv1beta1.PodGroup{}, org1PGs...), pgOrg2Ask),
+				Queues:          issueQueues,
+				ExpectStatus:    map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-org2": scheduling.PodGroupInqueue},
+				ExpectPipeLined: map[string][]string{"ns1/pg-org2": {"n1"}},
+				ExpectEvictNum:  2,
+				ExpectEvicted:   []string{"ns1/org1-5", "ns1/org1-4"},
+			},
+		},
+		{
+			// Requirement. The example from volcano-sh/volcano#4825 in its guarantee form. leaf-2
+			// is under its deserved and guarantee, the parent is full, and leaf-1 is 4c over its
+			// deserved: admitted, then reclaim takes leaf-1 down to its deserved and no further
+			// (the guarantee floor and the deserved check agree here).
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:            "G12: PR 4825 example, guaranteed sibling reclaims an over-deserved borrower under a full parent",
+				Plugins:         plugins,
+				Pods:            append(append([]*corev1.Pod{}, leaf1Pods...), gapPendingPod("leaf2-driver", "pg-leaf-2", "4")),
+				Nodes:           []*corev1.Node{gapNode("n1", "10")},
+				PodGroups:       append(append([]*schedulingv1beta1.PodGroup{}, leaf1PGs...), pgLeaf2Ask),
+				Queues:          prExampleQueues,
+				ExpectStatus:    map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-leaf-2": scheduling.PodGroupInqueue},
+				ExpectPipeLined: map[string][]string{"ns1/pg-leaf-2": {"n1"}},
+				ExpectEvictNum:  2,
+				ExpectEvicted:   []string{"ns1/l1-5", "ns1/l1-4"},
 			},
 		},
 	}
