@@ -244,6 +244,10 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	// G: PodGroups that carry minResources are gated at enqueue, before reclaim runs.
 	pgStandbyMinRes := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupPending)
 	pgActiveMinRes := util.BuildPodGroupWithMinResources("pg-active", gapNS, "active", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupRunning)
+	// G3: the shape the PodGroup controller produces for bare pods (pod == PodGroup): one Running
+	// PodGroup per holder pod, minMember 1, minResources equal to that pod's request.
+	pgExec1MinRes := util.BuildPodGroupWithMinResources("pg-exec-1", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
+	pgExec2MinRes := util.BuildPodGroupWithMinResources("pg-exec-2", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 
 	cases := []gapCase{
 		// ---------------------------------------------------------------- A. capacity-gap reclaim
@@ -916,6 +920,30 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				Pods:            []*corev1.Pod{exec1, exec2Protected, ask},
 				Nodes:           []*corev1.Node{n1},
 				PodGroups:       []*schedulingv1beta1.PodGroup{pgActiveMinRes, pgStandbyMinRes},
+				Queues:          defaultGapTree.queues(),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-1"},
+			},
+		},
+		{
+			// EXPECT-FAIL. The pod == PodGroup shape: every pod runs without a pre-created
+			// PodGroup, so the controller gives each one a minMember-1 PodGroup whose
+			// minResources equal the pod's own request. A single-pod PodGroup therefore has no
+			// elastic usage, and a failover ask (itself carrying minResources) is rejected at
+			// enqueue as in G2 even though reclaim could serve it. For this shape the reclaim fix
+			// alone is not enough; the enqueue-side follow-up is required.
+			skip: "EXPECT-FAIL: with pod == PodGroup every holder carries minResources equal to its usage, so the enqueue gate rejects a failover ask blocked only by an ancestor cap (volcano-sh/volcano#4817, follow-up)",
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G3: pod == PodGroup shape, failover ask blocked at enqueue by an ancestor cap should be enqueued and then reclaimed",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					gapRunningPod("exec-2", "pg-exec-2", "2", false),
+					ask,
+				},
+				Nodes:           []*corev1.Node{n1},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes},
 				Queues:          defaultGapTree.queues(),
 				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
 				ExpectEvictNum:  1,
