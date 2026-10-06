@@ -197,7 +197,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 					continue
 				}
 
-				ra.reclaimForTask(ssn, stmt, task, job)
+				ra.reclaimForTask(ssn, stmt, queue, task, job)
 			}
 
 			if ssn.JobPipelined(job) {
@@ -220,7 +220,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 // reclaimForTask tries to place task by evicting on one node. With firstFit the first node with a
 // viable plan is committed. With bestFit every candidate node is planned and rolled back, the
 // cheapest plan is replayed and committed.
-func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, job *api.JobInfo) {
+func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo) {
 	totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 	predicateHelper := util.NewPredicateHelper()
 	predicateNodes, _ := predicateHelper.PredicateNodes(task, totalNodes, ssn.PredicateForPreemptAction, ra.enablePredicateErrorCache, ssn.NodesInShard)
@@ -230,13 +230,12 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		predicateNodesByShardFlattened = append(predicateNodesByShardFlattened, nodes...)
 	}
 
-	queue := ssn.Queues[job.Queue]
 	var best *nodePlan
 	planned := 0
 	for _, n := range predicateNodesByShardFlattened {
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.", task.Namespace, task.Name, n.Name)
 
-		plan := planOnNode(ssn, task, job, n)
+		plan := planOnNode(ssn, queue, task, job, n)
 		if plan == nil {
 			continue
 		}
@@ -331,9 +330,10 @@ func (p *nodePlan) cheaperThan(o *nodePlan, ssn *framework.Session, asker *api.Q
 }
 
 // planOnNode explores serving the task on node: it evicts that node's admissible victims, cheapest
-// first, into a per-node statement until the task fits, then pipelines the task there. It returns
+// first, into a per-node statement until the task fits the node and its queue hierarchy, then
+// pipelines the task there. It returns
 // the open plan, or nil after rolling the statement back when the node cannot serve the task.
-func planOnNode(ssn *framework.Session, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) *nodePlan {
+func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) *nodePlan {
 	reclaimees := reclaimeesOnNode(ssn, job, task, n)
 	if len(reclaimees) == 0 {
 		klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
@@ -351,7 +351,7 @@ func planOnNode(ssn *framework.Session, task *api.TaskInfo, job *api.JobInfo, n 
 	reclaimed := api.EmptyResource()
 
 	availableResources := n.FutureIdle()
-	reclaimerFits := reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
+	reclaimerFits := reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources)
 
 	// Use a per-node statement so that evictions are isolated to this node. Only a plan whose
 	// Pipeline succeeds is ever merged into the caller's statement; everything else is discarded
@@ -366,7 +366,7 @@ func planOnNode(ssn *framework.Session, task *api.TaskInfo, job *api.JobInfo, n 
 		plan.evictionOccurred = true
 		reclaimed.Add(reclaimee.Resreq)
 		availableResources.Add(reclaimee.Resreq)
-		reclaimerFits = reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
+		reclaimerFits = reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources)
 	}
 
 	klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
@@ -433,9 +433,19 @@ func reclaimeesOnNode(ssn *framework.Session, job *api.JobInfo, task *api.TaskIn
 	return ordered
 }
 
-// reclaimerFitsOnNode verifies available resources and plugin predicates after tentative evictions.
-func reclaimerFitsOnNode(ssn *framework.Session, task *api.TaskInfo, node *api.NodeInfo, resreq, availableResources *api.Resource) bool {
-	return resreq.LessEqual(availableResources, api.Zero) &&
+// reclaimerFitsOnNode verifies that, after the tentative evictions recorded so far, the reclaimer
+// both fits the node physically and is allocatable in its queue hierarchy.
+//
+// The queue check is what lets reclaim serve an ask that is starved by an ancestor queue's
+// capability rather than by node capacity (volcano-sh/volcano#4817): plugins' DeallocateFunc
+// handlers run on every tentative Evict, so the capacity plugin's per-queue (and per-ancestor)
+// allocated counters already reflect the victims chosen so far, and ssn.Allocatable observes
+// them. Without this term the loop stops as soon as the node has room, evicts nothing, and the
+// ask is refused by the same Allocatable check in the next allocate pass, forever.
+// This mirrors preemptorFitsOnNode in the preempt action.
+func reclaimerFitsOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, node *api.NodeInfo, resreq, availableResources *api.Resource) bool {
+	return ssn.Allocatable(queue, task) &&
+		resreq.LessEqual(availableResources, api.Zero) &&
 		ssn.PredicateFn(task, node) == nil
 }
 
