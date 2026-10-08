@@ -1261,6 +1261,28 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvicted:   []string{"ns1/l1-5", "ns1/l1-4"},
 			},
 		},
+		{
+			// Documenting a limitation. The slack estimate is cluster-wide, but reclaim evicts
+			// only on the one node it is trying, and the hierarchical shortfall must be covered by
+			// victims on that node. Here active's two 2c pods sit on different nodes, the 4c ask
+			// needs both, so each per-node attempt frees only 2c, is discarded, and nothing is
+			// evicted. The job is admitted on 4c of slack, stays Inqueue, and is never served.
+			enqueueReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G13: admitted on cluster-wide slack, but the victims are spread over nodes and reclaim cannot serve it",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					util.BuildPod(gapNS, "exec-2", "n2", corev1.PodRunning, cpuMem("2"), "pg-exec-2", preemptableLabel(true), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:          []*corev1.Node{n1, gapNode("n2", "8")},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues:         gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupInqueue},
+				ExpectEvictNum: 0,
+			},
+		},
 	}
 
 	for i, c := range cases {
