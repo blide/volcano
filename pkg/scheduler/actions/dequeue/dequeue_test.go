@@ -34,10 +34,11 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
-func condition(condType scheduling.PodGroupConditionType, status v1.ConditionStatus, age time.Duration) schedulingv1beta1.PodGroupCondition {
+func condition(condType scheduling.PodGroupConditionType, status v1.ConditionStatus, reason string, age time.Duration) schedulingv1beta1.PodGroupCondition {
 	return schedulingv1beta1.PodGroupCondition{
 		Type:               schedulingv1beta1.PodGroupConditionType(condType),
 		Status:             status,
+		Reason:             reason,
 		LastTransitionTime: metav1.NewTime(time.Now().Add(-age)),
 	}
 }
@@ -62,114 +63,163 @@ func findCond(job *api.JobInfo, condType scheduling.PodGroupConditionType) *sche
 	return nil
 }
 
+func ptr(s v1.ConditionStatus) *v1.ConditionStatus { return &s }
+
 func TestDequeue(t *testing.T) {
-	config := []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "1m"}}}
+	timeoutConfig := []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "1m"}}}
 	queue := util.BuildQueue("q1", 1, api.BuildResourceList("8", "8Gi"))
 	node := util.BuildNode("n1", api.BuildResourceList("8", "8Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{})
 	pending := util.BuildPod("ns1", "p1", "", v1.PodPending, api.BuildResourceList("1", "1Gi"), "pg1", map[string]string{}, map[string]string{})
 	running := util.BuildPod("ns1", "p0", "n1", v1.PodRunning, api.BuildResourceList("1", "1Gi"), "pg1", map[string]string{}, map[string]string{})
 	minRes := api.BuildResourceList("1", "1Gi")
+	inqueueNoProgress := func(conds ...schedulingv1beta1.PodGroupCondition) uthelper.TestCommonStruct {
+		return uthelper.TestCommonStruct{
+			Pods:      []*v1.Pod{pending},
+			PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, minRes, conds...)},
+			Queues:    []*schedulingv1beta1.Queue{queue},
+		}
+	}
 
 	cases := []struct {
-		name       string
-		test       uthelper.TestCommonStruct
-		actions    []framework.Action
-		wantPhase  scheduling.PodGroupPhase
-		wantInq    *v1.ConditionStatus // expected Inqueue condition status, nil = must be absent
-		wantDequed bool
+		name          string
+		test          uthelper.TestCommonStruct
+		config        []conf.Configuration
+		reclaimResult api.ReclaimOutcome // set on the job before the actions run
+		actions       []framework.Action
+		wantPhase     scheduling.PodGroupPhase
+		wantInq       *v1.ConditionStatus // expected Inqueue condition status, nil = must be absent
+		wantDequeued  string              // expected Dequeued condition reason, "" = must be absent
 	}{
+		// --- reclaim verdict lane (default configuration)
 		{
-			name: "Inqueue stamp older than the timeout and no progress: moved back to Pending",
-			test: uthelper.TestCommonStruct{
-				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, minRes, condition(api.PodGroupInqueueType, v1.ConditionTrue, 2*time.Minute))},
-				Queues:    []*schedulingv1beta1.Queue{queue},
-			},
-			actions:    []framework.Action{dequeue.New()},
-			wantPhase:  scheduling.PodGroupPending,
-			wantInq:    ptr(v1.ConditionFalse),
-			wantDequed: true,
+			name:          "reclaim failed with victims: dequeued at once",
+			test:          inqueueNoProgress(),
+			reclaimResult: api.ReclaimFailed,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupPending,
+			wantInq:       ptr(v1.ConditionFalse),
+			wantDequeued:  dequeue.DequeuedReasonReclaimFailed,
 		},
 		{
-			name: "Inqueue stamp younger than the timeout: untouched",
-			test: uthelper.TestCommonStruct{
-				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, minRes, condition(api.PodGroupInqueueType, v1.ConditionTrue, 10*time.Second))},
-				Queues:    []*schedulingv1beta1.Queue{queue},
-			},
+			name:          "reclaim found no victims: ordinary waiting, untouched",
+			test:          inqueueNoProgress(),
+			reclaimResult: api.ReclaimNoVictims,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupInqueue,
+		},
+		{
+			name:          "reclaim found no victims for a group admitted on reclaimable slack: dequeued at once",
+			test:          inqueueNoProgress(condition(api.PodGroupInqueueType, v1.ConditionTrue, api.PodGroupInqueueReasonAncestorCapReclaim, time.Second)),
+			reclaimResult: api.ReclaimNoVictims,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupPending,
+			wantInq:       ptr(v1.ConditionFalse),
+			wantDequeued:  dequeue.DequeuedReasonReclaimFailed,
+		},
+		{
+			name:          "reclaim not attempted and no timeout configured: untouched even with a stale stamp",
+			test:          inqueueNoProgress(condition(api.PodGroupInqueueType, v1.ConditionTrue, "", time.Hour)),
+			reclaimResult: api.ReclaimNotAttempted,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupInqueue,
+			wantInq:       ptr(v1.ConditionTrue),
+		},
+		{
+			name:          "reclaim succeeded this session: untouched",
+			test:          inqueueNoProgress(),
+			reclaimResult: api.ReclaimSucceeded,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupInqueue,
+		},
+		// --- timeout lane (opt-in)
+		{
+			name:      "timeout: stamp older than the timeout and no progress: moved back to Pending",
+			test:      inqueueNoProgress(condition(api.PodGroupInqueueType, v1.ConditionTrue, "", 2*time.Minute)),
+			config:    timeoutConfig,
+			actions:   []framework.Action{dequeue.New()},
+			wantPhase: scheduling.PodGroupPending,
+			wantInq:   ptr(v1.ConditionFalse), wantDequeued: dequeue.DequeuedReasonInqueueTimeout,
+		},
+		{
+			name:      "timeout: stamp younger than the timeout: untouched",
+			test:      inqueueNoProgress(condition(api.PodGroupInqueueType, v1.ConditionTrue, "", 10*time.Second)),
+			config:    timeoutConfig,
 			actions:   []framework.Action{dequeue.New()},
 			wantPhase: scheduling.PodGroupInqueue,
 			wantInq:   ptr(v1.ConditionTrue),
 		},
 		{
-			name: "no stamp yet: stamped and left Inqueue",
-			test: uthelper.TestCommonStruct{
-				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, minRes)},
-				Queues:    []*schedulingv1beta1.Queue{queue},
-			},
+			name:      "timeout: no stamp yet: stamped and left Inqueue",
+			test:      inqueueNoProgress(),
+			config:    timeoutConfig,
 			actions:   []framework.Action{dequeue.New()},
 			wantPhase: scheduling.PodGroupInqueue,
 			wantInq:   ptr(v1.ConditionTrue),
 		},
 		{
-			name: "a running task counts as progress: untouched even with a stale stamp",
+			name: "a running task counts as progress: untouched even with a stale stamp and a failed verdict",
 			test: uthelper.TestCommonStruct{
 				Pods:      []*v1.Pod{running, pending},
 				Nodes:     []*v1.Node{node},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 2, minRes, condition(api.PodGroupInqueueType, v1.ConditionTrue, time.Hour))},
+				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 2, minRes, condition(api.PodGroupInqueueType, v1.ConditionTrue, "", time.Hour))},
 				Queues:    []*schedulingv1beta1.Queue{queue},
 			},
-			actions:   []framework.Action{dequeue.New()},
-			wantPhase: scheduling.PodGroupInqueue,
-			wantInq:   ptr(v1.ConditionTrue),
+			config:        timeoutConfig,
+			reclaimResult: api.ReclaimFailed,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupInqueue,
+			wantInq:       ptr(v1.ConditionTrue),
 		},
 		{
 			name: "no minResources: nothing is reserved, untouched",
 			test: uthelper.TestCommonStruct{
 				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, nil, condition(api.PodGroupInqueueType, v1.ConditionTrue, time.Hour))},
+				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupInqueue, 1, nil, condition(api.PodGroupInqueueType, v1.ConditionTrue, "", time.Hour))},
 				Queues:    []*schedulingv1beta1.Queue{queue},
 			},
-			actions:   []framework.Action{dequeue.New()},
-			wantPhase: scheduling.PodGroupInqueue,
-			wantInq:   ptr(v1.ConditionTrue),
+			config:        timeoutConfig,
+			reclaimResult: api.ReclaimFailed,
+			actions:       []framework.Action{dequeue.New()},
+			wantPhase:     scheduling.PodGroupInqueue,
+			wantInq:       ptr(v1.ConditionTrue),
 		},
+		// --- enqueue backoff
 		{
 			name: "enqueue honors the backoff: dequeued recently stays Pending",
 			test: uthelper.TestCommonStruct{
 				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupPending, 1, minRes, condition(api.PodGroupDequeuedType, v1.ConditionTrue, 10*time.Second))},
+				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupPending, 1, minRes, condition(api.PodGroupDequeuedType, v1.ConditionTrue, dequeue.DequeuedReasonReclaimFailed, 10*time.Second))},
 				Queues:    []*schedulingv1beta1.Queue{queue},
 			},
-			actions:    []framework.Action{enqueue.New()},
-			wantPhase:  scheduling.PodGroupPending,
-			wantDequed: true,
+			actions:      []framework.Action{enqueue.New()},
+			wantPhase:    scheduling.PodGroupPending,
+			wantDequeued: dequeue.DequeuedReasonReclaimFailed,
 		},
 		{
 			name: "enqueue after the backoff: admitted again",
 			test: uthelper.TestCommonStruct{
 				Pods:      []*v1.Pod{pending},
-				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupPending, 1, minRes, condition(api.PodGroupDequeuedType, v1.ConditionTrue, 2*time.Minute))},
+				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupPending, 1, minRes, condition(api.PodGroupDequeuedType, v1.ConditionTrue, dequeue.DequeuedReasonReclaimFailed, 2*time.Minute))},
 				Queues:    []*schedulingv1beta1.Queue{queue},
 			},
-			actions:    []framework.Action{enqueue.New()},
-			wantPhase:  scheduling.PodGroupInqueue,
-			wantDequed: true,
+			actions:      []framework.Action{enqueue.New()},
+			wantPhase:    scheduling.PodGroupInqueue,
+			wantDequeued: dequeue.DequeuedReasonReclaimFailed,
 		},
 		{
-			name: "re-admitted group is stamped afresh by the next dequeue pass",
+			name: "re-admitted group is stamped afresh by the next timeout pass",
 			test: uthelper.TestCommonStruct{
 				Pods: []*v1.Pod{pending},
 				PodGroups: []*schedulingv1beta1.PodGroup{podGroup(schedulingv1beta1.PodGroupPending, 1, minRes,
-					condition(api.PodGroupInqueueType, v1.ConditionFalse, 2*time.Minute),
-					condition(api.PodGroupDequeuedType, v1.ConditionTrue, 2*time.Minute))},
+					condition(api.PodGroupInqueueType, v1.ConditionFalse, dequeue.DequeuedReasonInqueueTimeout, 2*time.Minute),
+					condition(api.PodGroupDequeuedType, v1.ConditionTrue, dequeue.DequeuedReasonInqueueTimeout, 2*time.Minute))},
 				Queues: []*schedulingv1beta1.Queue{queue},
 			},
-			actions:    []framework.Action{enqueue.New(), dequeue.New()},
-			wantPhase:  scheduling.PodGroupInqueue,
-			wantInq:    ptr(v1.ConditionTrue),
-			wantDequed: true,
+			config:       timeoutConfig,
+			actions:      []framework.Action{enqueue.New(), dequeue.New()},
+			wantPhase:    scheduling.PodGroupInqueue,
+			wantInq:      ptr(v1.ConditionTrue),
+			wantDequeued: dequeue.DequeuedReasonInqueueTimeout,
 		},
 	}
 
@@ -179,8 +229,9 @@ func TestDequeue(t *testing.T) {
 			test.Name = c.name
 			test.Plugins = map[string]framework.PluginBuilder{}
 			test.ExpectStatus = map[api.JobID]scheduling.PodGroupPhase{"ns1/pg1": c.wantPhase}
-			ssn := test.RegisterSession(nil, config)
+			ssn := test.RegisterSession(nil, c.config)
 			defer test.Close()
+			ssn.Jobs["ns1/pg1"].ReclaimResult = c.reclaimResult
 			test.Run(c.actions)
 			if err := test.CheckAll(i); err != nil {
 				t.Fatal(err)
@@ -195,32 +246,36 @@ func TestDequeue(t *testing.T) {
 			case c.wantInq != nil && inq.Status != *c.wantInq:
 				t.Fatalf("Inqueue condition status: want %s, got %s", *c.wantInq, inq.Status)
 			}
-			if deq := findCond(job, api.PodGroupDequeuedType); (deq != nil) != c.wantDequed {
-				t.Fatalf("Dequeued condition present=%v, want %v", deq != nil, c.wantDequed)
+			deq := findCond(job, api.PodGroupDequeuedType)
+			switch {
+			case c.wantDequeued == "" && deq != nil:
+				t.Fatalf("unexpected Dequeued condition %+v", *deq)
+			case c.wantDequeued != "" && deq == nil:
+				t.Fatalf("missing Dequeued condition, want reason %s", c.wantDequeued)
+			case c.wantDequeued != "" && deq.Reason != c.wantDequeued:
+				t.Fatalf("Dequeued condition reason: want %s, got %s", c.wantDequeued, deq.Reason)
 			}
 		})
 	}
 }
 
-func ptr(s v1.ConditionStatus) *v1.ConditionStatus { return &s }
-
 func TestParseArguments(t *testing.T) {
 	cases := []struct {
 		name        string
 		config      []conf.Configuration
-		wantTimeout time.Duration
 		wantBackoff time.Duration
+		wantTimeout time.Duration
 	}{
-		{name: "defaults", config: nil, wantTimeout: dequeue.DefaultInqueueTimeout, wantBackoff: dequeue.DefaultInqueueTimeout},
-		{name: "timeout only sets both", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "5m"}}}, wantTimeout: 5 * time.Minute, wantBackoff: 5 * time.Minute},
-		{name: "both set", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "5m", dequeue.EnqueueBackoffKey: "30s"}}}, wantTimeout: 5 * time.Minute, wantBackoff: 30 * time.Second},
-		{name: "invalid falls back", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "soon", dequeue.EnqueueBackoffKey: "-1m"}}}, wantTimeout: dequeue.DefaultInqueueTimeout, wantBackoff: dequeue.DefaultInqueueTimeout},
+		{name: "defaults: backoff 1m, timeout disabled", config: nil, wantBackoff: dequeue.DefaultEnqueueBackoff, wantTimeout: 0},
+		{name: "timeout only", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "5m"}}}, wantBackoff: dequeue.DefaultEnqueueBackoff, wantTimeout: 5 * time.Minute},
+		{name: "both set", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "5m", dequeue.EnqueueBackoffKey: "30s"}}}, wantBackoff: 30 * time.Second, wantTimeout: 5 * time.Minute},
+		{name: "invalid falls back", config: []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "soon", dequeue.EnqueueBackoffKey: "-1m"}}}, wantBackoff: dequeue.DefaultEnqueueBackoff, wantTimeout: 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			timeout, backoff := dequeue.ParseArguments(c.config)
-			if timeout != c.wantTimeout || backoff != c.wantBackoff {
-				t.Fatalf("want (%s, %s), got (%s, %s)", c.wantTimeout, c.wantBackoff, timeout, backoff)
+			backoff, timeout := dequeue.ParseArguments(c.config)
+			if backoff != c.wantBackoff || timeout != c.wantTimeout {
+				t.Fatalf("want (backoff %s, timeout %s), got (%s, %s)", c.wantBackoff, c.wantTimeout, backoff, timeout)
 			}
 		})
 	}

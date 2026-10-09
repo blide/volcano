@@ -50,7 +50,7 @@ func (enqueue *Action) Execute(ssn *framework.Session) {
 	queues := util.NewPriorityQueue(ssn.QueueOrderFn)
 	queueSet := sets.NewString()
 	jobsMap := map[api.QueueID]*util.PriorityQueue{}
-	_, dequeueBackoff := dequeue.ParseArguments(ssn.Configurations)
+	dequeueBackoff, _ := dequeue.ParseArguments(ssn.Configurations)
 	now := time.Now()
 
 	for _, job := range ssn.Jobs {

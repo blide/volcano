@@ -86,6 +86,8 @@ type gapCase struct {
 	// RegisterSession for action arguments.
 	actions []framework.Action
 	config  []conf.Configuration
+	// check runs extra assertions on the session after CheckAll.
+	check func(t *testing.T, ssn *framework.Session)
 	// non-empty: t.Skip with this reason (EXPECT-FAIL).
 	skip string
 }
@@ -1298,14 +1300,52 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			},
 		},
 		{
-			// Documenting the safety net. The G13 group, already Inqueue for longer than the
-			// dequeue action's timeout with no task placed: reclaim still cannot serve it, and the
-			// dequeue action moves it back to Pending, releasing its reservation. Nothing is evicted.
+			// Requirement (safety net). G13 with the dequeue action behind reclaim and no timeout
+			// configured: the group is admitted on cluster-wide slack, reclaim finds victims but
+			// cannot make either node fit and reports ReclaimFailed, and dequeue returns the group
+			// to Pending in the same session. Nothing is evicted, the reservation is released, and
+			// the enqueue backoff keeps it out of the next cycle.
 			enqueueReclaim: true,
 			actions:        []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G14: admitted on cluster-wide slack, reclaim reports failure, dequeued in the same session",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					util.BuildPod(gapNS, "exec-2", "n2", corev1.PodRunning, cpuMem("2"), "pg-exec-2", preemptableLabel(true), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:          []*corev1.Node{n1, gapNode("n2", "8")},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues:         gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+			check: func(t *testing.T, ssn *framework.Session) {
+				job := ssn.Jobs["ns1/pg-standby"]
+				if job.ReclaimResult != api.ReclaimFailed {
+					t.Fatalf("ReclaimResult: want ReclaimFailed, got %v", job.ReclaimResult)
+				}
+				var dequeued *scheduling.PodGroupCondition
+				for i := range job.PodGroup.Status.Conditions {
+					if job.PodGroup.Status.Conditions[i].Type == api.PodGroupDequeuedType {
+						dequeued = &job.PodGroup.Status.Conditions[i]
+					}
+				}
+				if dequeued == nil || dequeued.Reason != dequeue.DequeuedReasonReclaimFailed {
+					t.Fatalf("Dequeued condition with reason %s missing: %+v", dequeue.DequeuedReasonReclaimFailed, job.PodGroup.Status.Conditions)
+				}
+			},
+		},
+		{
+			// Documenting the timeout lane. The same group already Inqueue for two hours but
+			// never evaluated by reclaim (the action is not configured): only the opt-in timeout
+			// returns it to Pending.
+			enqueueReclaim: true,
+			actions:        []framework.Action{enqueue.New(), allocate.New(), dequeue.New()},
 			config:         []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "1h"}}},
 			TestCommonStruct: uthelper.TestCommonStruct{
-				Name:    "G14: a group stuck Inqueue past the dequeue timeout is moved back to Pending",
+				Name:    "G15: without a reclaim verdict, only the opt-in timeout dequeues a stuck group",
 				Plugins: plugins,
 				Pods: []*corev1.Pod{
 					gapRunningPod("exec-1", "pg-exec-1", "2", true),
@@ -1326,13 +1366,16 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
 			}
-			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), c.config)
+			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), c.config)
 			defer c.Close()
 			caseActions := actions
 			if c.actions != nil {
 				caseActions = c.actions
 			}
 			c.Run(caseActions)
+			if c.check != nil {
+				c.check(t, ssn)
+			}
 			if err := c.CheckAll(i); err != nil {
 				t.Fatal(err)
 			}

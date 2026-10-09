@@ -24,6 +24,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
@@ -73,6 +74,9 @@ type capacityPlugin struct {
 	// preemptableRunningByQueue caches, per session, the sum of preemptable running task requests
 	// per leaf queue; it is only built when enqueueAncestorCapReclaim needs it.
 	preemptableRunningByQueue map[api.QueueID]*api.Resource
+	// admittedOnAncestorSlack lists the jobs enqueueableViaAncestorReclaim admitted in this session,
+	// so JobEnqueuedFn can tag their PodGroup for the dequeue action.
+	admittedOnAncestorSlack map[api.JobID]struct{}
 
 	queueOpts map[api.QueueID]*queueAttr
 	// Arguments given for the plugin
@@ -836,6 +840,21 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 				}
 			}
 		}
+		if _, admitted := cp.admittedOnAncestorSlack[job.UID]; admitted {
+			// Tag the PodGroup: its admission depends on reclaim. The dequeue action returns it to
+			// Pending as soon as reclaim reports it cannot serve it.
+			cond := &scheduling.PodGroupCondition{
+				Type:               api.PodGroupInqueueType,
+				Status:             v1.ConditionTrue,
+				LastTransitionTime: metav1.Now(),
+				TransitionID:       string(ssn.UID),
+				Reason:             api.PodGroupInqueueReasonAncestorCapReclaim,
+				Message:            "admitted past an ancestor capability on reclaimable slack; served by the reclaim action",
+			}
+			if err := ssn.UpdatePodGroupCondition(job, cond); err != nil {
+				klog.Errorf("[capacity] failed to tag job <%s/%s> as admitted on reclaimable slack: %v", job.Namespace, job.Name, err)
+			}
+		}
 		klog.V(5).Infof("job <%s/%s> enqueued", job.Namespace, job.Name)
 	})
 
@@ -1083,6 +1102,7 @@ func (cp *capacityPlugin) OnSessionClose(ssn *framework.Session) {
 	cp.queueOpts = nil
 	cp.queueGateReservedTasks = nil
 	cp.preemptableRunningByQueue = nil
+	cp.admittedOnAncestorSlack = nil
 }
 
 // initQueueAttr initializes a queueAttr from queueInfo.
@@ -1818,6 +1838,10 @@ func (cp *capacityPlugin) enqueueableViaAncestorReclaim(ssn *framework.Session, 
 			enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name, shortfall, slack)
 	}
 
+	if cp.admittedOnAncestorSlack == nil {
+		cp.admittedOnAncestorSlack = map[api.JobID]struct{}{}
+	}
+	cp.admittedOnAncestorSlack[job.UID] = struct{}{}
 	return true
 }
 

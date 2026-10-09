@@ -484,7 +484,36 @@ type JobInfo struct {
 	// reads Skip.Enqueue; allocate and backfill read Skip.Allocate and Skip.Tasks.
 	// Zero value means the Job is evaluated normally this session.
 	Skip SkipDecision
+
+	// ReclaimResult is the reclaim action's verdict on this job in the current session. It is
+	// session-scoped (never persisted) and read by actions that run after reclaim, such as dequeue.
+	ReclaimResult ReclaimOutcome
 }
+
+// ReclaimOutcome is what the reclaim action concluded about a job in one session.
+type ReclaimOutcome int
+
+const (
+	// ReclaimNotAttempted: reclaim did not evaluate the job (not starving, queue overused, action
+	// not configured, or no task passed the preemptive and pre-predicate checks).
+	ReclaimNotAttempted ReclaimOutcome = iota
+	// ReclaimNoVictims: reclaim evaluated the job but found no eligible victim on any candidate
+	// node. The job is waiting for capacity in the ordinary way.
+	ReclaimNoVictims
+	// ReclaimFailed: eligible victims existed on at least one node, but no node could be made to
+	// fit the job (physically and in its queue hierarchy), so every tentative eviction was rolled
+	// back. Reclaim cannot serve the job in the current cluster state.
+	ReclaimFailed
+	// ReclaimSucceeded: the job was pipelined by reclaim in this session.
+	ReclaimSucceeded
+)
+
+const (
+	// PodGroupInqueueReasonAncestorCapReclaim on the Inqueue condition marks a PodGroup that the
+	// capacity plugin admitted past an ancestor's capability on the strength of reclaimable slack.
+	// Its admission depends on reclaim serving it.
+	PodGroupInqueueReasonAncestorCapReclaim = "AncestorCapReclaim"
+)
 
 // NewJobInfo creates a new jobInfo for set of tasks
 func NewJobInfo(uid JobID, tasks ...*TaskInfo) *JobInfo {

@@ -163,6 +163,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			}
 			job := jobsQ.Pop().(*api.JobInfo)
 			stmt := framework.NewStatement(ssn)
+			attempted, victimsSeen, pipelinedAny := false, false, false
 
 			for {
 				// If job is not request more resource, then stop reclaiming.
@@ -197,7 +198,10 @@ func (ra *Action) Execute(ssn *framework.Session) {
 					continue
 				}
 
-				ra.reclaimForTask(ssn, stmt, queue, task, job)
+				attempted = true
+				seen, pipelined := ra.reclaimForTask(ssn, stmt, queue, task, job)
+				victimsSeen = victimsSeen || seen
+				pipelinedAny = pipelinedAny || pipelined
 			}
 
 			if ssn.JobPipelined(job) {
@@ -210,6 +214,20 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				stmt.Discard()
 			}
 
+			// Record the verdict for actions that run after reclaim (dequeue). It is derived from
+			// what this action did, not from JobPipelined, which defaults to permit when no plugin
+			// implements it.
+			switch {
+			case pipelinedAny:
+				job.ReclaimResult = api.ReclaimSucceeded
+			case !attempted:
+				job.ReclaimResult = api.ReclaimNotAttempted
+			case victimsSeen:
+				job.ReclaimResult = api.ReclaimFailed
+			default:
+				job.ReclaimResult = api.ReclaimNoVictims
+			}
+
 			if !jobsQ.Empty() {
 				queues.Push(queue)
 			}
@@ -217,10 +235,13 @@ func (ra *Action) Execute(ssn *framework.Session) {
 	}
 }
 
-// reclaimForTask tries to place task by evicting on one node. With firstFit the first node with a
-// viable plan is committed. With bestFit every candidate node is planned and rolled back, the
-// cheapest plan is replayed and committed.
-func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo) {
+// reclaimForTask tries to place task by evicting on one node. It returns whether eligible victims
+// were found on any candidate node, which lets the caller distinguish "nothing to reclaim" from
+// "victims existed but could not make the task fit", and whether the task was pipelined.
+//
+// With firstFit the first node with a viable plan is committed. With bestFit every candidate node
+// is planned and rolled back, the cheapest plan is replayed and committed.
+func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo) (victimsSeen, pipelined bool) {
 	totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 	predicateHelper := util.NewPredicateHelper()
 	predicateNodes, _ := predicateHelper.PredicateNodes(task, totalNodes, ssn.PredicateForPreemptAction, ra.enablePredicateErrorCache, ssn.NodesInShard)
@@ -235,13 +256,14 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 	for _, n := range predicateNodesByShardFlattened {
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.", task.Namespace, task.Name, n.Name)
 
-		plan := planOnNode(ssn, queue, task, job, n)
+		plan, seen := planOnNode(ssn, queue, task, job, n)
+		victimsSeen = victimsSeen || seen
 		if plan == nil {
 			continue
 		}
 		if ra.victimSelection != VictimSelectionBestFit {
 			stmt.Merge(plan.stmt)
-			return
+			return victimsSeen, true
 		}
 
 		// bestFit: roll the exploration back and keep the plan; the winner is replayed below.
@@ -255,9 +277,10 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 			break
 		}
 	}
-	if best != nil {
-		replayPlan(ssn, stmt, task, best)
+	if best == nil {
+		return victimsSeen, false
 	}
+	return victimsSeen, replayPlan(ssn, stmt, task, best)
 }
 
 // nodePlan is one viable way to serve the asker: the node, the victims evicted on it in order, and,
@@ -331,19 +354,20 @@ func (p *nodePlan) cheaperThan(o *nodePlan, ssn *framework.Session, asker *api.Q
 
 // planOnNode explores serving the task on node: it evicts that node's admissible victims, cheapest
 // first, into a per-node statement until the task fits the node and its queue hierarchy, then
-// pipelines the task there. It returns
-// the open plan, or nil after rolling the statement back when the node cannot serve the task.
-func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) *nodePlan {
+// pipelines the task there. It returns the open plan, or nil after rolling the statement back
+// when the node cannot serve the task; and whether the plugins admitted any victim on the node.
+func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) (plan *nodePlan, victimsSeen bool) {
 	reclaimees := reclaimeesOnNode(ssn, job, task, n)
 	if len(reclaimees) == 0 {
 		klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
-		return nil
+		return nil, false
 	}
 
 	victims := ssn.Reclaimable(task, reclaimees)
+	victimsSeen = len(victims) > 0
 	if err := util.ValidateVictims(task, n, victims); err != nil {
 		klog.V(3).Infof("No validated victims on Node <%s>: %v", n.Name, err)
-		return nil
+		return nil, victimsSeen
 	}
 
 	victimsQueue := ssn.BuildVictimsPriorityQueue(victims, task)
@@ -356,7 +380,7 @@ func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo
 	// Use a per-node statement so that evictions are isolated to this node. Only a plan whose
 	// Pipeline succeeds is ever merged into the caller's statement; everything else is discarded
 	// so victims on nodes that end up unused are never committed to Kubernetes.
-	plan := &nodePlan{node: n, stmt: framework.NewStatement(ssn)}
+	plan = &nodePlan{node: n, stmt: framework.NewStatement(ssn)}
 	for !victimsQueue.Empty() && !reclaimerFits {
 		reclaimee := victimsQueue.Pop().(*api.TaskInfo)
 		klog.V(3).Infof("Try to reclaim Task <%s/%s> for Tasks <%s/%s>",
@@ -373,20 +397,20 @@ func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo
 
 	if !reclaimerFits {
 		plan.stmt.Discard()
-		return nil
+		return nil, victimsSeen
 	}
 	if err := plan.stmt.Pipeline(task, n.Name, plan.evictionOccurred); err != nil {
 		klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>: %v", task.Namespace, task.Name, n.Name, err)
 		plan.stmt.Discard()
-		return nil
+		return nil, victimsSeen
 	}
-	return plan
+	return plan, victimsSeen
 }
 
 // replayPlan re-applies a plan whose exploration was rolled back and merges it into stmt. Nothing
 // runs between the exploration and the replay within a session, so the victims are still Running
 // and the node is as it was; a failure here is a state bug, not a scheduling outcome.
-func replayPlan(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, plan *nodePlan) {
+func replayPlan(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, plan *nodePlan) bool {
 	nodeStmt := framework.NewStatement(ssn)
 	for _, victim := range plan.victims {
 		nodeStmt.Evict(victim, "reclaim")
@@ -395,11 +419,12 @@ func replayPlan(ssn *framework.Session, stmt *framework.Statement, task *api.Tas
 		klog.Errorf("Failed to replay the best-fit reclaim plan for Task <%s/%s> on Node <%s>: %v",
 			task.Namespace, task.Name, plan.node.Name, err)
 		nodeStmt.Discard()
-		return
+		return false
 	}
 	klog.V(3).Infof("Best-fit reclaim for Task <%s/%s>: Node <%s>, %d victims, highest victim priority %d",
 		task.Namespace, task.Name, plan.node.Name, len(plan.victims), plan.maxPriority())
 	stmt.Merge(nodeStmt)
+	return true
 }
 
 // reclaimeesOnNode lists the Running, preemptable tasks on node that belong to another, reclaimable

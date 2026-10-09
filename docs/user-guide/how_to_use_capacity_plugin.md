@@ -125,8 +125,9 @@ this admission. The gang plugin's `minAvailable` veto on victims is not modeled 
 gang `reclaimable` enabled a job may be admitted whose last victim gang refuses to evict. The slack is
 also summed cluster-wide while reclaim evicts on one node at a time, so an ask whose reclaimable
 usage is spread over several nodes can be admitted and never served. Pair this admission with the
-[dequeue action](../design/dequeue-action.md), which moves a PodGroup that made no progress within
-a timeout back to `Pending` and releases its reservation.
+[dequeue action](../design/dequeue-action.md): PodGroups admitted this way are tagged, and the
+dequeue action returns one to `Pending`, releasing its reservation, in the same session that the
+reclaim action reports it cannot serve it.
 
 ## Choose the cheapest victims across nodes
 
