@@ -92,9 +92,10 @@ With the defaults the action is driven purely by reclaim's verdict.
 
 - The unschedulable-job cache (`job.Skip.Enqueue`) is independent: it suppresses enqueue attempts
   based on rejection hints, while the backoff here is time based. Both are honored.
-- The capacity plugin's `enqueueAncestorCapReclaim` admission is the main producer of jobs this
-  action cleans up; see the capacity plugin user guide. Enabling that admission without this action
-  leaves no bound on a mis-admitted job's reservation.
+- The capacity plugin's `enqueueAncestorCapReclaim` admission is a trial that relies on this
+  action: it admits on entitlement alone, reclaim tries in the same session, and this action
+  reverts the admission on a failed verdict. The plugin refuses the relaxed admission when this
+  action is not enabled. See the capacity plugin user guide.
 - The gang plugin's `Unschedulable` condition is unaffected; the `Inqueue` and `Dequeued` conditions
   are additional entries in the same list. The verdict is derived from what reclaim did, not from
   the session's job-pipelined query, which defaults to permit when no plugin implements it.

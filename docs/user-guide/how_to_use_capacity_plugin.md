@@ -106,28 +106,24 @@ over-deserved sibling for it. The job stays Pending and reclaim never sees it (s
 [volcano-sh/volcano#4817](https://github.com/volcano-sh/volcano/issues/4817)).
 
 Setting the plugin argument `enqueueAncestorCapReclaim: true` (hierarchy mode only, default `false`) admits
-such a job when all of the following hold on every resource dimension it requests:
+such a job for a trial by the `reclaim` action when all of the following hold on every resource dimension it
+requests:
 
 - the leaf queue passes its own enqueue check unchanged (the leaf `capability` is never relaxed);
 - after admission the leaf stays at or under its `deserved`: `allocated + inqueue + minResources <= deserved`,
   with no elastic credit, and a requested dimension missing from `deserved` counts as zero;
-- every ancestor that fails its check fails only on `capability`, and the reclaimable slack in its subtree
-  covers the shortfall. Slack is summed over leaf queues that are open and reclaimable, excluding the asker,
-  and per leaf is the minimum of usage above `deserved`, usage above `guarantee`, and the requests of
-  preemptable running pods. When `ancestorReclaimLevel` is greater than 0, intermediate queues outside the
-  asker's own branch are also capped by their usage above `deserved`.
+- every ancestor that fails its check fails only on `capability`.
 
-Jobs admitted this way are then served by the `reclaim` action in the same or a following session, so
-`reclaim` must be in the `actions` list (the default configuration does not include it); without it an
-admitted job stays `Inqueue` and keeps its `inqueue` reservation. Other plugins with `enableJobEnqueued`
-still vote: a `Reject` from any of them (for example `overcommit` on a fully allocated cluster) wins over
-this admission. The gang plugin's `minAvailable` veto on victims is not modeled by this check, so with
-gang `reclaimable` enabled a job may be admitted whose last victim gang refuses to evict. The slack is
-also summed cluster-wide while reclaim evicts on one node at a time, so an ask whose reclaimable
-usage is spread over several nodes can be admitted and never served. Pair this admission with the
-[dequeue action](../design/dequeue-action.md): PodGroups admitted this way are tagged, and the
-dequeue action returns one to `Pending`, releasing its reservation, in the same session that the
-reclaim action reports it cannot serve it.
+The gate does not predict what reclaim will free. The admitted PodGroup is tagged (an `Inqueue` condition with
+reason `AncestorCapReclaim`), the `reclaim` action tries to serve it in the same session, and the
+[dequeue action](../design/dequeue-action.md) returns it to `Pending` when reclaim reports that it cannot: either
+because victims existed but no node could be made to fit, or because there was nothing to reclaim at all. A
+failed trial commits no eviction and leaves only those conditions behind; the job is reconsidered after the
+dequeue action's `enqueueBackoff`. The `dequeue` action must therefore be in the `actions` list after `reclaim`;
+if it is not, the relaxed admission is refused with a warning and the strict gate's verdict stands.
+
+Other plugins with `enableJobEnqueued` still vote: a `Reject` from any of them (for example `overcommit` on a
+fully allocated cluster) wins over this admission.
 
 ## Choose the cheapest victims across nodes
 

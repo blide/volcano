@@ -66,7 +66,7 @@ import (
 
 const (
 	// Dequeue is the action name.
-	Dequeue = "dequeue"
+	Dequeue = conf.DequeueActionName
 	// EnqueueBackoffKey is the action argument: how long a dequeued PodGroup stays Pending before
 	// the enqueue action considers it again. A Go duration string.
 	EnqueueBackoffKey = "enqueueBackoff"

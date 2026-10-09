@@ -35,6 +35,7 @@ import (
 	"volcano.sh/volcano/pkg/features"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/api/helpers"
+	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
 	"volcano.sh/volcano/pkg/scheduler/plugins/capacity/hintprovider"
@@ -44,8 +45,10 @@ import (
 const (
 	PluginName              = "capacity"
 	ancestorReclaimLevelKey = "ancestorReclaimLevel"
-	// enqueueAncestorCapReclaimKey enables admitting a job at enqueue when it is blocked only by an
-	// ancestor queue's capability that reclaim can free (see volcano-sh/volcano#4817).
+	// enqueueAncestorCapReclaimKey enables admitting a job at enqueue when it is entitled to the
+	// capacity (its leaf stays under deserved) and only an ancestor queue's capability blocks it, so
+	// that the reclaim action can try to serve it; the dequeue action reverts the admission when
+	// reclaim cannot (see volcano-sh/volcano#4817).
 	enqueueAncestorCapReclaimKey = "enqueueAncestorCapReclaim"
 
 	// preFilterStateKey is the key in CycleState to InterPodAffinity pre-computed data for Filtering.
@@ -71,12 +74,11 @@ type capacityPlugin struct {
 	// enqueueAncestorCapReclaim admits a job whose only enqueue blocker is an ancestor capability
 	// when the ancestor's subtree holds enough reclaimable slack to serve it. Default false.
 	enqueueAncestorCapReclaim bool
-	// preemptableRunningByQueue caches, per session, the sum of preemptable running task requests
-	// per leaf queue; it is only built when enqueueAncestorCapReclaim needs it.
-	preemptableRunningByQueue map[api.QueueID]*api.Resource
-	// admittedOnAncestorSlack lists the jobs enqueueableViaAncestorReclaim admitted in this session,
+	// admittedPastAncestorCap lists the jobs enqueueableViaAncestorReclaim admitted in this session,
 	// so JobEnqueuedFn can tag their PodGroup for the dequeue action.
-	admittedOnAncestorSlack map[api.JobID]struct{}
+	admittedPastAncestorCap map[api.JobID]struct{}
+	// warnedNoDequeue limits the "dequeue action not enabled" warning to once per session.
+	warnedNoDequeue bool
 
 	queueOpts map[api.QueueID]*queueAttr
 	// Arguments given for the plugin
@@ -840,7 +842,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 				}
 			}
 		}
-		if _, admitted := cp.admittedOnAncestorSlack[job.UID]; admitted {
+		if _, admitted := cp.admittedPastAncestorCap[job.UID]; admitted {
 			// Tag the PodGroup: its admission depends on reclaim. The dequeue action returns it to
 			// Pending as soon as reclaim reports it cannot serve it.
 			cond := &scheduling.PodGroupCondition{
@@ -1101,8 +1103,8 @@ func (cp *capacityPlugin) OnSessionClose(ssn *framework.Session) {
 	cp.totalGuarantee = nil
 	cp.queueOpts = nil
 	cp.queueGateReservedTasks = nil
-	cp.preemptableRunningByQueue = nil
-	cp.admittedOnAncestorSlack = nil
+	cp.admittedPastAncestorCap = nil
+	cp.warnedNoDequeue = false
 }
 
 // initQueueAttr initializes a queueAttr from queueInfo.
@@ -1777,20 +1779,31 @@ func (cp *capacityPlugin) checkJobEnqueueableHierarchically(ssn *framework.Sessi
 }
 
 // enqueueableViaAncestorReclaim decides whether a job that failed checkJobEnqueueableHierarchically
-// may be enqueued anyway because reclaim can serve it (volcano-sh/volcano#4817, enqueue-side form).
-// All of the following must hold, on every dimension the job requests:
+// may be enqueued anyway so that the reclaim action can try to serve it (volcano-sh/volcano#4817,
+// enqueue-side form). It establishes entitlement only and does not predict reclaim:
 //
 //  1. the leaf passes its own enqueue check unchanged (its realCapability is never relaxed);
-//  2. the leaf stays at or under its deserved after admission: allocated + inqueue + minReq <= deserved,
-//     with no elastic credit, and a requested dimension missing from deserved counts as zero;
-//  3. every ancestor that fails its check fails only on realCapability, and the reclaimable slack in
-//     its subtree (reclaimableSlackUnder) covers the shortfall.
+//  2. the leaf stays at or under its deserved after admission on every requested dimension:
+//     allocated + inqueue + minReq <= deserved, with no elastic credit, and a requested dimension
+//     missing from deserved counts as zero;
+//  3. every ancestor that fails its check fails only on realCapability (a DRA failure still rejects).
 //
-// Gang's minAvailable veto is not modeled: a job may be admitted whose last victim gang would refuse.
-// Admission is otherwise conservative: slack is capped by over-deserved usage, by usage above the
-// guarantee, and by preemptable running requests, and intermediate ancestors off the asker's path are
-// also capped by their own over-deserved usage when ancestorReclaimLevel > 0.
+// Admission is a trial. The job is tagged (JobEnqueuedFn writes the Inqueue condition with reason
+// AncestorCapReclaim), the reclaim action tries to serve it in the same session, and the dequeue
+// action returns it to Pending when reclaim reports that it cannot (ReclaimFailed, or
+// ReclaimNoVictims for a tagged job). A failed trial commits nothing but those conditions and one
+// session of inqueue reservation. The dequeue action must therefore be enabled; without it the
+// relaxed path is refused and the strict gate's verdict stands.
 func (cp *capacityPlugin) enqueueableViaAncestorReclaim(ssn *framework.Session, queue *api.QueueInfo, job *api.JobInfo) bool {
+	if !conf.EnabledActionMap[conf.DequeueActionName] {
+		if !cp.warnedNoDequeue {
+			klog.Warningf("[capacity] %s is enabled but the %s action is not; refusing the relaxed admission because nothing would revert a job reclaim cannot serve",
+				enqueueAncestorCapReclaimKey, conf.DequeueActionName)
+			cp.warnedNoDequeue = true
+		}
+		return false
+	}
+
 	leafAttr := cp.queueOpts[queue.UID]
 	minReq := job.GetMinResources()
 
@@ -1826,88 +1839,15 @@ func (cp *capacityPlugin) enqueueableViaAncestorReclaim(ssn *framework.Session, 
 				enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name)
 			return false
 		}
-
-		shortfall := api.ExceededPart(future, ancestorAttr.realCapability)
-		slack := cp.reclaimableSlackUnder(ssn, ancestorAttr, queue.UID)
-		if ok, dims := shortfall.LessEqualWithDimensionAndResourcesName(slack, minReq); !ok {
-			klog.V(4).Infof("[capacity] %s: job <%s/%s> blocked at ancestor <%s>: shortfall <%v> exceeds reclaimable slack <%v> on %v",
-				enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name, shortfall, slack, dims)
-			return false
-		}
-		klog.V(4).Infof("[capacity] %s: job <%s/%s> admitted past ancestor <%s>: shortfall <%v> within reclaimable slack <%v>",
-			enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name, shortfall, slack)
+		klog.V(4).Infof("[capacity] %s: job <%s/%s> admitted past ancestor <%s> (realCapability <%v>, future <%v>) for a reclaim trial",
+			enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name, ancestorAttr.realCapability, future)
 	}
 
-	if cp.admittedOnAncestorSlack == nil {
-		cp.admittedOnAncestorSlack = map[api.JobID]struct{}{}
+	if cp.admittedPastAncestorCap == nil {
+		cp.admittedPastAncestorCap = map[api.JobID]struct{}{}
 	}
-	cp.admittedOnAncestorSlack[job.UID] = struct{}{}
+	cp.admittedPastAncestorCap[job.UID] = struct{}{}
 	return true
-}
-
-// reclaimableSlackUnder estimates how much reclaim could free in the subtree of ancestorAttr for an
-// asker in excludeLeaf. Per leaf queue (open, reclaimable, not the asker's): the minimum over
-// dimensions of usage above deserved, usage above guarantee, and preemptable running requests.
-// Intermediate queues off the asker's path are additionally capped by their own usage above deserved
-// when ancestorReclaimLevel > 0, mirroring the ancestor checks in ReclaimableFn.
-func (cp *capacityPlugin) reclaimableSlackUnder(ssn *framework.Session, ancestorAttr *queueAttr, excludeLeaf api.QueueID) *api.Resource {
-	onAskerPath := map[api.QueueID]struct{}{}
-	if leafAttr := cp.queueOpts[excludeLeaf]; leafAttr != nil {
-		for _, id := range leafAttr.ancestors {
-			onAskerPath[id] = struct{}{}
-		}
-	}
-
-	var walk func(attr *queueAttr) *api.Resource
-	walk = func(attr *queueAttr) *api.Resource {
-		if len(attr.children) == 0 {
-			if attr.queueID == excludeLeaf {
-				return api.EmptyResource()
-			}
-			q := ssn.Queues[attr.queueID]
-			if q == nil || !q.Reclaimable() || q.Queue.Status.State != scheduling.QueueStateOpen {
-				return api.EmptyResource()
-			}
-			slack := api.ExceededPart(attr.allocated, attr.deserved).Clone()
-			slack.MinDimensionResource(api.ExceededPart(attr.allocated, attr.guarantee), api.Zero)
-			slack.MinDimensionResource(cp.preemptableRunningInQueue(ssn, attr.queueID), api.Zero)
-			return slack
-		}
-
-		sum := api.EmptyResource()
-		for _, child := range attr.children {
-			sum.Add(walk(child))
-		}
-		if _, shared := onAskerPath[attr.queueID]; !shared && attr != ancestorAttr && cp.ancestorReclaimLevel > 0 {
-			sum.MinDimensionResource(api.ExceededPart(attr.allocated, attr.deserved), api.Zero)
-		}
-		return sum
-	}
-
-	return walk(ancestorAttr)
-}
-
-// preemptableRunningInQueue sums the requests of preemptable Running tasks of jobs in the queue.
-// The result is cached for the session because running tasks do not change during enqueue.
-func (cp *capacityPlugin) preemptableRunningInQueue(ssn *framework.Session, queueID api.QueueID) *api.Resource {
-	if cp.preemptableRunningByQueue == nil {
-		cp.preemptableRunningByQueue = map[api.QueueID]*api.Resource{}
-		for _, job := range ssn.Jobs {
-			for _, task := range job.TaskStatusIndex[api.Running] {
-				if !task.Preemptable {
-					continue
-				}
-				if _, found := cp.preemptableRunningByQueue[job.Queue]; !found {
-					cp.preemptableRunningByQueue[job.Queue] = api.EmptyResource()
-				}
-				cp.preemptableRunningByQueue[job.Queue].Add(task.Resreq)
-			}
-		}
-	}
-	if res, found := cp.preemptableRunningByQueue[queueID]; found {
-		return res
-	}
-	return api.EmptyResource()
 }
 
 func getCapacityState(cycleState fwk.CycleState) (*capacityState, error) {

@@ -169,28 +169,37 @@ under-deserved sibling asks: the gate rejects the job at the parent, the PodGrou
 handled in the `reclaim` action's stop condition (`reclaimerFitsOnNode` includes `ssn.Allocatable`).
 
 With plugin argument `enqueueAncestorCapReclaim: true` (hierarchy mode only, default `false`), a job that
-fails the gate is admitted by `enqueueableViaAncestorReclaim` only when, on every requested dimension:
+fails the gate is admitted by `enqueueableViaAncestorReclaim` for a trial by the reclaim action when, on every
+requested dimension:
 
 1. the leaf passes its own check unchanged;
 2. the leaf stays at or under its `deserved` after admission, without elastic credit (a requested dimension
    missing from `deserved` counts as zero);
-3. every failing ancestor fails on `realCapability` only (a DRA failure still rejects) and
-   `reclaimableSlackUnder` covers the shortfall `minResources + allocated + inqueue - elastic - realCapability`.
+3. every failing ancestor fails on `realCapability` only (a DRA failure still rejects).
 
-`reclaimableSlackUnder` sums, over open and reclaimable leaf queues in the ancestor's subtree other than the
-asker, the per-dimension minimum of usage above `deserved`, usage above `guarantee` and preemptable running
-requests; intermediate queues outside the asker's branch are additionally capped by their usage above
-`deserved` when `ancestorReclaimLevel > 0`, mirroring the ancestor checks in `ReclaimableFn`. The rule is
-strictly all-dimension and never relaxes the leaf's own capability, in contrast to the approach in
+The gate establishes entitlement and nothing more. The trial is the real reclaim run in the same session:
+`JobEnqueuedFn` tags the PodGroup with an `Inqueue` condition whose reason is `AncestorCapReclaim`, the
+reclaim action evaluates the job and records a verdict (`JobInfo.ReclaimResult`), and the dequeue action,
+running after reclaim, returns the job to `Pending` on `ReclaimFailed` (victims existed, no node could be made
+to fit, every tentative eviction rolled back) or on `ReclaimNoVictims` for a tagged job (the admission premise
+was false). A failed trial persists only the two conditions; the `inqueue` reservation lasts one session and
+the job is reconsidered after `enqueueBackoff`. The relaxed path is refused when the dequeue action is not
+enabled (`conf.EnabledActionMap`), since nothing would revert a job reclaim cannot serve.
+
+This replaces an earlier estimate of reclaimable slack in the gate. The estimate re-implemented the victim
+rules and could be wrong in the conservative direction: an over-deserved victim can carry a resource the
+queue is not over-deserved on (G9), which reclaim frees but an estimate keyed on deserved exceedance does not
+see. The trial cannot be wrong, because it is reclaim itself. The rule is strictly all-dimension on the asker
+side and never relaxes the leaf's own capability, in contrast to the approach in
 [volcano-sh/volcano#4825](https://github.com/volcano-sh/volcano/pull/4825), which admitted on any single
 dimension below `deserved` or `guarantee` and skipped the capability checks. `inqueue` accounting
-(`JobEnqueuedFn`) is unchanged, so several asks admitted in one session see each other's reservations.
-Gang's `minAvailable` veto on victims is not modeled.
+(`JobEnqueuedFn`) is unchanged.
 
 The table-driven test `Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation` (section G) covers the
-default rejection, admission with reclaim in the same session, and the negative cases: non-preemptable
-holders, `reclaimable: false`, holders at `deserved`, a leaf over `deserved` on one dimension, a shortfall
-above the slack, and a multi-dimension ask with slack on one dimension only.
+default rejection, admission with reclaim in the same session, the trials that dequeue reverts (non-preemptable
+holders, `reclaimable: false`, holders at `deserved`, victims that cannot free enough, victims spread over
+nodes), the entitlement rejection (a leaf over `deserved` on one dimension), the cpu+gpu case the estimate
+got wrong, and the refusal when the dequeue action is absent.
 
 #### Unit test scenarios and behavior map
 

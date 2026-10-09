@@ -24,6 +24,10 @@ package conf
 // EnabledActionMap check if a action exist in scheduler configmap. If not exist the value is false.
 var EnabledActionMap map[string]bool
 
+// DequeueActionName is the name of the dequeue action. Plugins whose admission relies on it (the
+// capacity plugin's enqueueAncestorCapReclaim) consult EnabledActionMap with this key.
+const DequeueActionName = "dequeue"
+
 // SchedulerConfiguration defines the configuration of scheduler.
 type SchedulerConfiguration struct {
 	// Actions defines the actions list of scheduler in order
