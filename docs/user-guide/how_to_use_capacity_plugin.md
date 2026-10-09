@@ -125,6 +125,25 @@ if it is not, the relaxed admission is refused with a warning and the strict gat
 Other plugins with `enableJobEnqueued` still vote: a `Reject` from any of them (for example `overcommit` on a
 fully allocated cluster) wins over this admission.
 
+### Volcano Jobs
+
+A Volcano Job's pods are created by the job controller only after its PodGroup is `Inqueue`, so in the
+admission session reclaim has no task to evaluate, the verdict is "not attempted", and the trial continues
+in the sessions after the pods appear. Two settings make this usable:
+
+- Enable the `SchedulingGatesQueueAdmission` feature gate on the scheduler and the admission webhook and put
+  `scheduling.volcano.sh/queue-allocation-gate: "true"` in the Job's pod template annotations. The webhook then
+  creates the pods with Volcano's scheduling gate: the api-server keeps them out of cluster autoscalers'
+  view, and the `reclaim` action treats a pod gated only by that gate as a real asker, so the trial runs on
+  the real pods (with their affinity, tolerations and requests) while they are still gated. `allocate`
+  removes the gate once the queue check passes, after the victims have been evicted. A dequeued Job keeps
+  its gated pods; they stay invisible and are picked up again on re-admission.
+- Set `inqueueTimeout` on the dequeue action as a fallback for Jobs whose pods never appear (for example
+  while the job controller is unavailable); without pods there is never a reclaim verdict.
+
+Without the feature gate the pods are created ungated, which works but exposes them as `Unschedulable`
+to autoscalers during the trial.
+
 ## Choose the cheapest victims across nodes
 
 The `reclaim` action evicts on one node per task. By default it commits on the first candidate node

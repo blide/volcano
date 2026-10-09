@@ -26,8 +26,10 @@ import (
 	"math"
 
 	v1 "k8s.io/api/core/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
 
+	"volcano.sh/volcano/pkg/features"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/conf"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -94,6 +96,20 @@ func (ra *Action) parseArguments(ssn *framework.Session) {
 	}
 }
 
+// queueGatedAsker reports whether a scheduling-gated task may still be a reclaim asker: the pod
+// carries only Volcano's queue-allocation gate, opted in by annotation, and the
+// SchedulingGatesQueueAdmission feature is on. Such a pod is a real, fully specified pod that the
+// api-server keeps out of autoscalers' view until Volcano admits it; the allocate action already
+// treats it as a candidate for the queue check and removes the gate once that check passes.
+// Letting reclaim evaluate it too gives a Volcano Job a reclaim verdict (and the dequeue action a
+// decision) while its pods are still gated. Pods gated by anything else stay out, as before.
+func queueGatedAsker(task *api.TaskInfo) bool {
+	return utilfeature.DefaultFeatureGate.Enabled(features.SchedulingGatesQueueAdmission) &&
+		task.Pod != nil &&
+		api.HasOnlyVolcanoSchedulingGate(task.Pod) &&
+		api.HasQueueAllocationGateAnnotation(task.Pod)
+}
+
 func (ra *Action) Execute(ssn *framework.Session) {
 	klog.V(5).Infof("Enter Reclaim ...")
 	defer klog.V(5).Infof("Leaving Reclaim ...")
@@ -135,7 +151,7 @@ func (ra *Action) Execute(ssn *framework.Session) {
 			preemptorsMap[job.Queue].Push(job)
 			preemptorTasks[job.UID] = util.NewPriorityQueue(ssn.TaskOrderFn)
 			for _, task := range job.TaskStatusIndex[api.Pending] {
-				if task.SchGated {
+				if task.SchGated && !queueGatedAsker(task) {
 					continue
 				}
 				preemptorTasks[job.UID].Push(task)

@@ -24,9 +24,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"volcano.sh/volcano/pkg/features"
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/actions/dequeue"
 	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
@@ -91,6 +94,8 @@ type gapCase struct {
 	config  []conf.Configuration
 	// check runs extra assertions on the session after CheckAll.
 	check func(t *testing.T, ssn *framework.Session)
+	// queueGates enables the SchedulingGatesQueueAdmission feature gate for the case.
+	queueGates bool
 	// non-empty: t.Skip with this reason (EXPECT-FAIL).
 	skip string
 }
@@ -284,6 +289,13 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	pgExec2MinRes := util.BuildPodGroupWithMinResources("pg-exec-2", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 	pgProberMinRes := util.BuildPodGroupWithMinResources("pg-prober", gapNS, "infra", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 	pgStandbyMinRes4 := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+	// G20/G21: the A1 ask as a Volcano Job's pod would look under SchedulingGatesQueueAdmission:
+	// created after the PodGroup went Inqueue, carrying only Volcano's queue-allocation gate and
+	// the opt-in annotation. Invisible to autoscalers, not schedulable until the gate is removed.
+	gatedAsk := util.BuildPod(gapNS, "standby-driver", "", corev1.PodPending, cpuMem("2"), "pg-standby",
+		map[string]string{}, map[string]string{})
+	gatedAsk.Annotations[schedulingv1beta1.QueueAllocationGateKey] = "true"
+	gatedAsk.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: schedulingv1beta1.QueueAllocationGateKey}}
 	// G13: the same 4c ask, already Inqueue (admitted in an earlier session).
 	pgStandbyInqueue4 := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupInqueue)
 	// G15: the same 4c ask, already Inqueue for two hours without progress.
@@ -1497,12 +1509,51 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		{
+			// Requirement (Volcano Jobs). With the queue-admission scheduling gate feature on, a
+			// pod gated only by Volcano's gate is a real asker for reclaim: the A1 reclaim happens
+			// while the pod is still gated, so the job gets its verdict before anyone can see an
+			// Unschedulable pod. Allocate removes the gate once the queue check passes.
+			queueGates: true,
+			actions:    []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			check:      verdictIs(api.ReclaimSucceeded),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:            "G20: a Volcano-gated asker is reclaimed for while still gated",
+				Plugins:         plugins,
+				Pods:            []*corev1.Pod{exec1, exec2Protected, gatedAsk},
+				Nodes:           []*corev1.Node{n1},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          defaultGapTree.queues(),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-1"},
+			},
+		},
+		{
+			// Documenting. The same gated asker without the feature gate: reclaim skips gated
+			// tasks as before, no verdict, nothing evicted, the job waits Inqueue.
+			actions: []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			check:   verdictIs(api.ReclaimNotAttempted),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "G21: without the feature gate a gated asker is ignored by reclaim",
+				Plugins:        plugins,
+				Pods:           []*corev1.Pod{exec1, exec2Protected, gatedAsk},
+				Nodes:          []*corev1.Node{n1},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:         defaultGapTree.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupInqueue},
+				ExpectEvictNum: 0,
+			},
+		},
 	}
 
 	for i, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
+			}
+			if c.queueGates {
+				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulingGatesQueueAdmission, true)
 			}
 			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.gangPipelined, c.starvingByPending, c.enqueueReclaim), c.config)
 			defer c.Close()

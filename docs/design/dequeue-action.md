@@ -120,13 +120,18 @@ implemented yet.
 - A vcjob has no pods until the PodGroup is `Inqueue`. In the admission session reclaim finds no
   tasks, the verdict is `ReclaimNotAttempted`, dequeue does nothing, the phase persists as
   `Inqueue`, the job controller creates the pods, and only the next session yields a real verdict.
-  The trial is therefore not a dry run for vcjobs: pods exist for at least one session, the
-  reservation lasts that long, and autoscalers see Pending pods.
-- If the pods never appear or are all scheduling-gated, reclaim skips the job every session and no
-  verdict is ever produced. Only the opt-in `inqueueTimeout` covers this. Follow-up: treat a tagged
-  group with `ReclaimNotAttempted` for N consecutive sessions as a failed trial, or document the
-  timeout as mandatory for vcjob users.
-- On a dequeue the created pods are not deleted; they stay Pending until re-admission.
+  The trial therefore spans sessions for vcjobs and the reservation lasts that long.
+- Mitigation in place: with the `SchedulingGatesQueueAdmission` feature gate and the opt-in pod
+  annotation, the pods are created gated, autoscalers never see them, and the reclaim action now
+  treats a pod gated only by Volcano's queue-allocation gate as an asker (`queueGatedAsker`), so the
+  trial runs on the real gated pods and allocate removes the gate once the queue check passes.
+  See the capacity plugin user guide, "Volcano Jobs".
+- If the pods never appear, or are gated by something other than Volcano's gate, reclaim skips the
+  job every session and no verdict is ever produced. Only the opt-in `inqueueTimeout` covers this.
+  Follow-up: treat a tagged group with `ReclaimNotAttempted` for N consecutive sessions as a failed
+  trial.
+- On a dequeue the created pods are not deleted; they stay Pending (gated, if the feature is on)
+  until re-admission, when the next trial runs in the same session.
 - The verdict is keyed on the commit: a statement discarded by the job-pipelined check (gang's
   minAvailable) after a partial pipeline is `ReclaimFailed`, because victims existed and the job
   was not served. The legacy reclaim action is task-level and applies gang semantics only at
