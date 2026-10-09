@@ -88,6 +88,9 @@ type gapCase struct {
 	starvingByPending bool
 	// enable the capacity plugin's enqueueAncestorCapReclaim argument (enqueue-side admission).
 	enqueueReclaim bool
+	// enable the capacity plugin's reserveDeserved argument (owed deserved share charged to the
+	// allocatable check at every ancestor).
+	reserveDeserved bool
 	// actions overrides the default enqueue, reclaim, allocate sequence; config is passed to
 	// RegisterSession for action arguments.
 	actions []framework.Action
@@ -153,7 +156,7 @@ func (tr gapTree) queues() []*schedulingv1beta1.Queue {
 	}
 }
 
-func gapTiers(level int, withPriority, gangReclaim, gangPipelined, starvingByPending, enqueueReclaim bool) []conf.Tier {
+func gapTiers(level int, withPriority, gangReclaim, gangPipelined, starvingByPending, enqueueReclaim, reserveDeserved bool) []conf.Tier {
 	trueValue := true
 	withPriority = withPriority || starvingByPending
 	capacityOpt := conf.PluginOption{
@@ -165,13 +168,16 @@ func gapTiers(level int, withPriority, gangReclaim, gangPipelined, starvingByPen
 		EnabledHierarchy:   &trueValue,
 		EnabledJobEnqueued: &trueValue,
 	}
-	if level > 0 || enqueueReclaim {
+	if level > 0 || enqueueReclaim || reserveDeserved {
 		capacityOpt.Arguments = framework.Arguments{}
 		if level > 0 {
 			capacityOpt.Arguments[ancestorReclaimLevelKey] = level
 		}
 		if enqueueReclaim {
 			capacityOpt.Arguments[enqueueAncestorCapReclaimKey] = true
+		}
+		if reserveDeserved {
+			capacityOpt.Arguments[reserveDeservedKey] = true
 		}
 	}
 	gangOpt := conf.PluginOption{Name: gang.PluginName, EnabledJobStarving: &trueValue}
@@ -392,6 +398,60 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	}
 	leaf1Pods, leaf1PGs := fiveHolders("l1", "leaf-1")
 	pgLeaf2Ask := util.BuildPodGroupWithMinResources("pg-leaf-2", gapNS, "leaf-2", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+
+	// H: the session after a successful reclaim, the "drain window". Last session reclaim evicted
+	// a1 (3c, now terminating) from active for standby's 2c ask and pipelined the ask; this session
+	// the ask is a plain Pending pod again and allocate runs before reclaim.
+	//
+	//	tenant   deserved 9c, cap 9c                 allocated 5c (terminating a1 not counted)
+	//	├── active   deserved 4c, cap 9c   a1 3c terminating, a2 2c protected   share 0.5
+	//	└── standby  deserved 5c, cap 9c   s1 3c protected, asks s2 2c          share 0.6
+	//	node n1: 12c, 4c idle (a1 still counted until it is gone)
+	//
+	// active sorts first (lower share), so its replacement pod a1-replacement (3c) is considered
+	// before the ask. The tenant has 4c of capability left: enough for either, not both.
+	reserveTree := func(tenantDeserved, tenantCap string) []*schedulingv1beta1.Queue {
+		return []*schedulingv1beta1.Queue{
+			gapQueue("root", "", "", ""),
+			gapQueue("tenant", "root", tenantDeserved, tenantCap),
+			gapQueue("active", "tenant", "4", "9"),
+			gapQueue("standby", "tenant", "5", "9"),
+		}
+	}
+	n12 := gapNode("n1", "12")
+	pgS1 := gapRunningPG("pg-s1", "standby")
+	// Built fresh per case: allocate writes the node name into the pod object it binds, so a pod
+	// shared between cases would already be placed in the next one.
+	drainPods := func() []*corev1.Pod {
+		deletionNow := metav1.Now()
+		a1Terminating := gapRunningPod("a1", "pg-active", "3", true)
+		a1Terminating.DeletionTimestamp = &deletionNow
+		return []*corev1.Pod{
+			a1Terminating,
+			gapRunningPod("a2", "pg-active", "2", false),
+			gapPendingPod("a1-replacement", "pg-active", "3"),
+			gapRunningPod("s1", "pg-s1", "3", false),
+			gapPendingPod("standby-driver", "pg-standby", "2"),
+		}
+	}
+	pgStandbyAsk2 := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupInqueue)
+	// H4: the same ask dequeued a moment ago, still in the enqueue backoff.
+	pgStandbyDequeued := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupPending)
+	pgStandbyDequeued.Status.Conditions = []schedulingv1beta1.PodGroupCondition{{
+		Type:               schedulingv1beta1.PodGroupConditionType(api.PodGroupDequeuedType),
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+	}}
+	// H2/H3: a third leaf under the tenant, within its deserved, with a 2c pod waiting.
+	reserveTreeWithOther := func(tenantCap string) []*schedulingv1beta1.Queue {
+		return append(reserveTree("9", tenantCap), gapQueue("other", "tenant", "2", "9"))
+	}
+	pgOther := gapRunningPG("pg-other", "other")
+	drainPodsWithOther := func() []*corev1.Pod {
+		return append(drainPods(), gapPendingPod("o1", "pg-other", "2"))
+	}
+	// Production order: allocate before reclaim.
+	productionActions := []framework.Action{enqueue.New(), allocate.New(), reclaim.New()}
 
 	cases := []gapCase{
 		// ---------------------------------------------------------------- A. capacity-gap reclaim
@@ -1545,6 +1605,133 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		// ---------------------------------------------------------------- H. reserveDeserved
+		{
+			// Baseline. Without the reservation the replacement of the evicted pod is admitted
+			// at the tenant (over its leaf deserved, under the tenant cap) and takes the space the
+			// eviction freed; the ask is refused and reclaim finds nothing left to evict. The
+			// eviction was spent for nothing.
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H1 baseline: the evicted pod's replacement takes the freed space ahead of the ask",
+				Plugins:        plugins,
+				Pods:           drainPods(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyAsk2},
+				Queues:         reserveTree("9", "9"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/a1-replacement": "n1"},
+				ExpectEvictNum: 0,
+			},
+			actions: productionActions,
+		},
+		{
+			// Requirement. With reserveDeserved the tenant charges active's candidate with the 2c
+			// standby is still owed (5c deserved, 3c allocated, 2c admitted): 5 + 3 + 2 > 9. The
+			// ask pays nothing for its own reserve (5 + 2 + 0 <= 9) and is placed.
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H1: the owed share is kept for the ask; the replacement waits",
+				Plugins:        plugins,
+				Pods:           drainPods(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyAsk2},
+				Queues:         reserveTree("9", "9"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/standby-driver": "n1"},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. A sibling within its own deserved is not blocked when the tenant has
+			// room beyond the owed share: other's 2c pod is charged standby's 2c (5 + 2 + 2 <= 9)
+			// and placed; the ask follows (7 + 2 <= 9); the over-deserved replacement still waits.
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H2: an entitled sibling allocates alongside the reserve when the parent has room for both",
+				Plugins:        plugins,
+				Pods:           drainPodsWithOther(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyAsk2, pgOther},
+				Queues:         reserveTreeWithOther("9"),
+				ExpectBindsNum: 2,
+				ExpectBindMap:  map[string]string{"ns1/o1": "n1", "ns1/standby-driver": "n1"},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. When the parent has room only for the owed share (cap 7c, allocated
+			// 5c), the reserve wins over an entitled sibling too: other sorts first but is charged
+			// 2c (5 + 2 + 2 > 7); the ask fits exactly (5 + 2 + 0 <= 7).
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H3: with room only for the owed share the ask is served before an entitled sibling",
+				Plugins:        plugins,
+				Pods:           drainPodsWithOther(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyAsk2, pgOther},
+				Queues:         reserveTreeWithOther("7"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/standby-driver": "n1"},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. A dequeued PodGroup (Pending, in the enqueue backoff) is not admitted
+			// and reserves nothing: the replacement is placed. Also covers an asker the dequeue
+			// action gave up on: its reservation ends with its admission.
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H4: a dequeued group reserves nothing",
+				Plugins:        plugins,
+				Pods:           drainPods(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyDequeued},
+				Queues:         reserveTree("9", "9"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/a1-replacement": "n1"},
+				ExpectEvictNum: 0,
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+			},
+		},
+		{
+			// Requirement. The parent reserves no more than its own deserved: tenant deserved 6c
+			// with 5c allocated owes its subtree 1c, not standby's 2c, so the replacement passes
+			// (5 + 3 + 1 <= 9) and the ask is refused this session (8 + 2 > 9).
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H5: the reserve is capped by the parent's own deserved",
+				Plugins:        plugins,
+				Pods:           drainPods(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandbyAsk2},
+				Queues:         reserveTree("6", "9"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/a1-replacement": "n1"},
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. A PodGroup without minResources is admitted unconditionally and is owed
+			// nothing; the reserve is derived from minResources only.
+			reserveDeserved: true,
+			actions:         productionActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:           "H6: a group without minResources reserves nothing",
+				Plugins:        plugins,
+				Pods:           drainPods(),
+				Nodes:          []*corev1.Node{n12},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgS1, pgStandby},
+				Queues:         reserveTree("9", "9"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/a1-replacement": "n1"},
+				ExpectEvictNum: 0,
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -1555,7 +1742,7 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.queueGates {
 				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulingGatesQueueAdmission, true)
 			}
-			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.gangPipelined, c.starvingByPending, c.enqueueReclaim), c.config)
+			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.gangPipelined, c.starvingByPending, c.enqueueReclaim, c.reserveDeserved), c.config)
 			defer c.Close()
 			caseActions := actions
 			switch {
