@@ -203,6 +203,17 @@ func getTaskRole(pod *v1.Pod) string {
 
 const TaskPriorityAnnotation = "volcano.sh/task-priority"
 
+const (
+	// PodGroupInqueueType is a PodGroup condition recorded by the dequeue action the first time it
+	// observes a PodGroup Inqueue without any scheduled task. Its LastTransitionTime is the clock
+	// the dequeue action compares against its inqueueTimeout. Status False marks a dequeued group.
+	PodGroupInqueueType scheduling.PodGroupConditionType = "Inqueue"
+	// PodGroupDequeuedType is set by the dequeue action when it moves a PodGroup from Inqueue back
+	// to Pending. The enqueue action keeps the group Pending while this condition is younger than
+	// the dequeue action's enqueueBackoff.
+	PodGroupDequeuedType scheduling.PodGroupConditionType = "Dequeued"
+)
+
 // NewTaskInfo creates new taskInfo object for a Pod
 func NewTaskInfo(pod *v1.Pod) *TaskInfo {
 	initResReq := GetPodResourceRequest(pod)

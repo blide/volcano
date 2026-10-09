@@ -23,6 +23,7 @@ package actions
 import (
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
 	"volcano.sh/volcano/pkg/scheduler/actions/backfill"
+	"volcano.sh/volcano/pkg/scheduler/actions/dequeue"
 	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
 	"volcano.sh/volcano/pkg/scheduler/actions/gangpreempt"
 	"volcano.sh/volcano/pkg/scheduler/actions/gangreclaim"
@@ -40,5 +41,6 @@ func init() {
 	framework.RegisterAction(gangpreempt.New())
 	framework.RegisterAction(gangreclaim.New())
 	framework.RegisterAction(enqueue.New())
+	framework.RegisterAction(dequeue.New())
 	framework.RegisterAction(shuffle.New())
 }

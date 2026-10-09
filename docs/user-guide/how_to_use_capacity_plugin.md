@@ -122,7 +122,11 @@ Jobs admitted this way are then served by the `reclaim` action in the same or a 
 admitted job stays `Inqueue` and keeps its `inqueue` reservation. Other plugins with `enableJobEnqueued`
 still vote: a `Reject` from any of them (for example `overcommit` on a fully allocated cluster) wins over
 this admission. The gang plugin's `minAvailable` veto on victims is not modeled by this check, so with
-gang `reclaimable` enabled a job may be admitted whose last victim gang refuses to evict.
+gang `reclaimable` enabled a job may be admitted whose last victim gang refuses to evict. The slack is
+also summed cluster-wide while reclaim evicts on one node at a time, so an ask whose reclaimable
+usage is spread over several nodes can be admitted and never served. Pair this admission with the
+[dequeue action](../design/dequeue-action.md), which moves a PodGroup that made no progress within
+a timeout back to `Pending` and releases its reservation.
 
 ## Choose the cheapest victims across nodes
 

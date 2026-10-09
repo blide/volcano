@@ -24,6 +24,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
+	"volcano.sh/volcano/pkg/scheduler/actions/dequeue"
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/framework"
 	"volcano.sh/volcano/pkg/scheduler/metrics"
@@ -49,6 +50,8 @@ func (enqueue *Action) Execute(ssn *framework.Session) {
 	queues := util.NewPriorityQueue(ssn.QueueOrderFn)
 	queueSet := sets.NewString()
 	jobsMap := map[api.QueueID]*util.PriorityQueue{}
+	_, dequeueBackoff := dequeue.ParseArguments(ssn.Configurations)
+	now := time.Now()
 
 	for _, job := range ssn.Jobs {
 		if job.ScheduleStartTimestamp.IsZero() {
@@ -73,6 +76,11 @@ func (enqueue *Action) Execute(ssn *framework.Session) {
 				metrics.RegisterUnschedulableJobCacheSkip(job.Namespace, job.Name, enqueue.Name())
 				klog.V(4).Infof("Skip enqueueing Job <%s/%s>: suppressed by unschedulable-job cache",
 					job.Namespace, job.Name)
+				continue
+			}
+			if dequeue.InBackoff(job, dequeueBackoff, now) {
+				klog.V(4).Infof("Skip enqueueing Job <%s/%s>: dequeued less than %s ago",
+					job.Namespace, job.Name, dequeueBackoff)
 				continue
 			}
 			if _, found := jobsMap[job.Queue]; !found {

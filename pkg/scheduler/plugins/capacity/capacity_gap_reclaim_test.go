@@ -19,13 +19,16 @@ package capacity
 import (
 	"strconv"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
 	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
 	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
+	"volcano.sh/volcano/pkg/scheduler/actions/dequeue"
 	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
 	"volcano.sh/volcano/pkg/scheduler/actions/reclaim"
 	"volcano.sh/volcano/pkg/scheduler/api"
@@ -79,6 +82,10 @@ type gapCase struct {
 	starvingByPending bool
 	// enable the capacity plugin's enqueueAncestorCapReclaim argument (enqueue-side admission).
 	enqueueReclaim bool
+	// actions overrides the default enqueue, reclaim, allocate sequence; config is passed to
+	// RegisterSession for action arguments.
+	actions []framework.Action
+	config  []conf.Configuration
 	// non-empty: t.Skip with this reason (EXPECT-FAIL).
 	skip string
 }
@@ -259,6 +266,13 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	pgExec2MinRes := util.BuildPodGroupWithMinResources("pg-exec-2", gapNS, "active", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 	pgProberMinRes := util.BuildPodGroupWithMinResources("pg-prober", gapNS, "infra", 1, nil, cpuMem("2"), schedulingv1beta1.PodGroupRunning)
 	pgStandbyMinRes4 := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupPending)
+	// G14: the same 4c ask, already Inqueue for two hours without progress.
+	pgStandbyStuck := util.BuildPodGroupWithMinResources("pg-standby", gapNS, "standby", 1, nil, cpuMem("4"), schedulingv1beta1.PodGroupInqueue)
+	pgStandbyStuck.Status.Conditions = []schedulingv1beta1.PodGroupCondition{{
+		Type:               schedulingv1beta1.PodGroupConditionType(api.PodGroupInqueueType),
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.NewTime(time.Now().Add(-2 * time.Hour)),
+	}}
 	// G9: a cpu+gpu ask. Only cpu has reclaimable slack under the tenant.
 	gpu := func(c, g string) corev1.ResourceList {
 		return api.BuildResourceList(c, c+"Gi", []api.ScalarResource{{Name: "nvidia.com/gpu", Value: g}}...)
@@ -1283,6 +1297,28 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		{
+			// Documenting the safety net. The G13 group, already Inqueue for longer than the
+			// dequeue action's timeout with no task placed: reclaim still cannot serve it, and the
+			// dequeue action moves it back to Pending, releasing its reservation. Nothing is evicted.
+			enqueueReclaim: true,
+			actions:        []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			config:         []conf.Configuration{{Name: dequeue.Dequeue, Arguments: map[string]interface{}{dequeue.InqueueTimeoutKey: "1h"}}},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G14: a group stuck Inqueue past the dequeue timeout is moved back to Pending",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					util.BuildPod(gapNS, "exec-2", "n2", corev1.PodRunning, cpuMem("2"), "pg-exec-2", preemptableLabel(true), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:          []*corev1.Node{n1, gapNode("n2", "8")},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyStuck},
+				Queues:         gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -1290,9 +1326,13 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
 			}
-			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), nil)
+			c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), c.config)
 			defer c.Close()
-			c.Run(actions)
+			caseActions := actions
+			if c.actions != nil {
+				caseActions = c.actions
+			}
+			c.Run(caseActions)
 			if err := c.CheckAll(i); err != nil {
 				t.Fatal(err)
 			}
