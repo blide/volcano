@@ -1359,6 +1359,66 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		{
+			// Requirement (flat queues). No hierarchy, no ancestor tag: the gate admits the 4c ask
+			// because the standby queue has quota, expecting the cluster to be freed by reclaim.
+			// active's 2c pods sit on two 3c nodes with 1c idle each, so no node can reach 4c even
+			// after evicting its victim: reclaim reports ReclaimFailed and dequeue returns the job
+			// to Pending in the same session with nothing evicted.
+			actions: []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G16: flat queues, fragmented victims, reclaim reports failure and the job is dequeued",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					util.BuildPod(gapNS, "exec-2", "n2", corev1.PodRunning, cpuMem("2"), "pg-exec-2", preemptableLabel(true), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:     []*corev1.Node{gapNode("n1", "3"), gapNode("n2", "3")},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("active", "root", "0", "8"),
+					gapQueue("standby", "root", "4", "8"),
+				},
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupPending},
+				ExpectEvictNum: 0,
+			},
+			check: func(t *testing.T, ssn *framework.Session) {
+				if got := ssn.Jobs["ns1/pg-standby"].ReclaimResult; got != api.ReclaimFailed {
+					t.Fatalf("ReclaimResult: want ReclaimFailed, got %v", got)
+				}
+			},
+		},
+		{
+			// Documenting (flat queues). Same ask, but the holders sit exactly at their deserved so
+			// nothing is reclaimable: ReclaimNoVictims is ordinary waiting for capacity, the job
+			// stays Inqueue and keeps its reservation, as before the dequeue action existed.
+			actions: []framework.Action{enqueue.New(), reclaim.New(), allocate.New(), dequeue.New()},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G17: flat queues, nothing reclaimable, the job waits Inqueue",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					gapRunningPod("exec-1", "pg-exec-1", "2", true),
+					util.BuildPod(gapNS, "exec-2", "n2", corev1.PodRunning, cpuMem("2"), "pg-exec-2", preemptableLabel(true), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes:     []*corev1.Node{gapNode("n1", "3"), gapNode("n2", "3")},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("active", "root", "4", "8"),
+					gapQueue("standby", "root", "4", "8"),
+				},
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupInqueue},
+				ExpectEvictNum: 0,
+			},
+			check: func(t *testing.T, ssn *framework.Session) {
+				if got := ssn.Jobs["ns1/pg-standby"].ReclaimResult; got != api.ReclaimNoVictims {
+					t.Fatalf("ReclaimResult: want ReclaimNoVictims, got %v", got)
+				}
+			},
+		},
 	}
 
 	for i, c := range cases {
