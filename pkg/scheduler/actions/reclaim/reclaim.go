@@ -204,7 +204,8 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				pipelinedAny = pipelinedAny || pipelined
 			}
 
-			if ssn.JobPipelined(job) {
+			committed := ssn.JobPipelined(job)
+			if committed {
 				hasEvictions := stmt.HasEvictions()
 				stmt.Commit()
 				if hasEvictions {
@@ -214,15 +215,18 @@ func (ra *Action) Execute(ssn *framework.Session) {
 				stmt.Discard()
 			}
 
-			// Record the verdict for actions that run after reclaim (dequeue). It is derived from
-			// what this action did, not from JobPipelined, which defaults to permit when no plugin
-			// implements it.
+			// Record the verdict for actions that run after reclaim (dequeue). The job counts as
+			// served only if this action pipelined a task and the statement was committed; a
+			// statement discarded by the job-pipelined check (gang's minAvailable) means victims
+			// existed but the job was not served. Gang-level reasoning itself stays with the
+			// gangreclaim action. JobPipelined defaults to permit when no plugin implements it, so
+			// "committed" alone is not evidence of success.
 			switch {
-			case pipelinedAny:
+			case committed && pipelinedAny:
 				job.ReclaimResult = api.ReclaimSucceeded
 			case !attempted:
 				job.ReclaimResult = api.ReclaimNotAttempted
-			case victimsSeen:
+			case victimsSeen || pipelinedAny:
 				job.ReclaimResult = api.ReclaimFailed
 			default:
 				job.ReclaimResult = api.ReclaimNoVictims

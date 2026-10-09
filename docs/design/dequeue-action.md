@@ -127,9 +127,11 @@ implemented yet.
   group with `ReclaimNotAttempted` for N consecutive sessions as a failed trial, or document the
   timeout as mandatory for vcjob users.
 - On a dequeue the created pods are not deleted; they stay Pending until re-admission.
-- The verdict is per job but reclaim commits per gang: if some tasks pipeline but fewer than
-  minAvailable, the statement is discarded while the verdict reads `ReclaimSucceeded`, so dequeue
-  leaves the job `Inqueue`. Follow-up: a verdict that reflects the gang outcome.
+- The verdict is keyed on the commit: a statement discarded by the job-pipelined check (gang's
+  minAvailable) after a partial pipeline is `ReclaimFailed`, because victims existed and the job
+  was not served. The legacy reclaim action is task-level and applies gang semantics only at
+  commit; gang-level victim reasoning belongs to the gangreclaim action, which has no verdict yet
+  and is out of scope here.
 
 ### Asks reclaim refuses to evaluate
 

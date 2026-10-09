@@ -77,6 +77,9 @@ type gapCase struct {
 	priority bool
 	// enable gang's ReclaimableFn (the minAvailable veto). Off by default, as in the baseline tiers.
 	gangReclaim bool
+	// enable gang's JobPipelinedFn, so reclaim commits a job only when minAvailable tasks are
+	// pipelined. Off by default, as in the baseline tiers (the session then defaults to permit).
+	gangPipelined bool
 	// take JobStarving from the priority plugin (any unplaced task) instead of gang
 	// (ready+pipelined < minAvailable). Implies priority.
 	starvingByPending bool
@@ -145,7 +148,7 @@ func (tr gapTree) queues() []*schedulingv1beta1.Queue {
 	}
 }
 
-func gapTiers(level int, withPriority, gangReclaim, starvingByPending, enqueueReclaim bool) []conf.Tier {
+func gapTiers(level int, withPriority, gangReclaim, gangPipelined, starvingByPending, enqueueReclaim bool) []conf.Tier {
 	trueValue := true
 	withPriority = withPriority || starvingByPending
 	capacityOpt := conf.PluginOption{
@@ -169,6 +172,9 @@ func gapTiers(level int, withPriority, gangReclaim, starvingByPending, enqueueRe
 	gangOpt := conf.PluginOption{Name: gang.PluginName, EnabledJobStarving: &trueValue}
 	if gangReclaim {
 		gangOpt.EnabledReclaimable = &trueValue
+	}
+	if gangPipelined {
+		gangOpt.EnabledJobPipelined = &trueValue
 	}
 	if starvingByPending {
 		// ssn.JobStarving ANDs every plugin with the flag on, so gang's must be off for the
@@ -1466,6 +1472,31 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		{
+			// Requirement (verdict semantics). A minMember-2 group already Inqueue, two 2c tasks,
+			// one admissible victim. Reclaim pipelines the first task, finds no victim for the
+			// second, and the job-pipelined check (gang, minAvailable 2) discards the statement.
+			// The verdict must be ReclaimFailed, not succeeded: victims existed and the job was not
+			// served. Gang-level victim reasoning belongs to gangreclaim, not here.
+			gangPipelined: true,
+			actions:       []framework.Action{enqueue.New(), reclaim.New(), allocate.New()},
+			check:         verdictIs(api.ReclaimFailed),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:    "G19: statement discarded by minAvailable after a partial pipeline is a failed verdict",
+				Plugins: plugins,
+				Pods: []*corev1.Pod{
+					exec1,
+					exec2Protected,
+					gapPendingPod("standby-driver", "pg-standby", "2"),
+					gapPendingPod("standby-exec", "pg-standby", "2"),
+				},
+				Nodes:          []*corev1.Node{n1},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, util.BuildPodGroup("pg-standby", gapNS, "standby", 2, nil, schedulingv1beta1.PodGroupInqueue)},
+				Queues:         gapTree{"4", "4", "0", "4", "4", "4"}.queues(),
+				ExpectStatus:   map[api.JobID]scheduling.PodGroupPhase{"ns1/pg-standby": scheduling.PodGroupInqueue},
+				ExpectEvictNum: 0,
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -1473,7 +1504,7 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			if c.skip != "" {
 				t.Skip(c.skip)
 			}
-			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.starvingByPending, c.enqueueReclaim), c.config)
+			ssn := c.RegisterSession(gapTiers(c.level, c.priority, c.gangReclaim, c.gangPipelined, c.starvingByPending, c.enqueueReclaim), c.config)
 			defer c.Close()
 			caseActions := actions
 			switch {
