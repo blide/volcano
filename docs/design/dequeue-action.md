@@ -182,9 +182,36 @@ implemented yet.
 ### The remaining structural limit
 
 - Reclaim frees quota only with victims on the node it is trying (G13). The trial recovers such a
-  job instead of leaving it stuck, but does not serve it. Follow-up: two-round reclaim (node fit,
-  then hierarchy headroom with victims from any node, dimension-aware, only after the node fits),
-  modeled on YuniKorn's `calculateAdditionalVictims`.
+  job instead of leaving it stuck, but does not serve it. Follow-up, designed but not implemented:
+  a second victim round in `reclaimForTask`, behind a reclaim action argument (`crossNodeVictims`,
+  default off), modeled on YuniKorn's `calculateAdditionalVictims`:
+  - runs once per task, on the first node the task fits physically after the local round while
+    `ssn.Allocatable` still fails, so the queue hierarchy is the only blocker;
+  - candidates are the reclaimees of every other node, filtered by `ssn.Reclaimable` (the capacity
+    plugin already keeps only over-deserved victim queues on the task's dimensions, applies
+    `ancestorReclaimLevel` and the gang veto, and sees the local evictions through its
+    `DeallocateFunc` counters);
+  - victims are ordered by the depth of their nearest common ancestor with the asker's queue,
+    deepest first, then by the usual victim order: an eviction lowers `allocated` at every
+    ancestor of the victim's queue, so it relieves the blocking ancestor only if it sits in that
+    ancestor's subtree, and `Allocatable` is boolean, so this ordering stands in for knowing the
+    blocker;
+  - evicted one at a time into the same per-node statement until `Allocatable` passes, so the
+    isolation of PR #5067 holds: nothing is committed unless the pipeline on that node succeeds;
+  - tests: G13 served with the flag (both victims, pipelined on n1), G14 served instead of
+    dequeued, G16 unchanged (no node fits physically, so no second round), and a two-tenant case
+    where the sibling's pod on another node is chosen over an over-deserved pod of another tenant.
+
+### Gang actions and the reserve
+
+- gangpreempt and gangreclaim check queues on the simulated path: PrePredicate clones every
+  queue attribute into a per-task cycle state, `SimulateAddTask`/`SimulateRemoveTask` adjust
+  `allocated` on the clones, and `SimulateAllocatableFn` checks the clones without the
+  `reserveDeserved` reserve. Follow-up, designed but not implemented: make the reserve helpers
+  take the attribute map (session map on the real path, state map on the simulated one), refresh
+  the touched leaf and re-fold its ancestors in the simulate hooks (removing a victim raises what
+  its leaf is owed), and pass the owed share in the simulated check. gangreclaim also has no
+  reclaim verdict for the dequeue action.
 
 ### What the trial fixes that the estimate could not
 
