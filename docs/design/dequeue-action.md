@@ -108,3 +108,75 @@ directions and re-stamping after re-admission. In `Test_capacityPlugin_ReclaimOn
 G14 admits a job on cluster-wide slack that reclaim cannot serve on any single node, asserts the
 `ReclaimFailed` verdict, and shows the job returned to `Pending` in the same session with nothing
 evicted; G15 shows the opt-in timeout doing the same for a job reclaim never evaluated.
+
+## Known gaps and follow-ups
+
+Where the admission-trial design (capacity `enqueueAncestorCapReclaim` + reclaim verdict + dequeue)
+can still leave a job in the wrong state, with the intended follow-up for each. None of these is
+implemented yet.
+
+### Volcano Jobs: the trial spans sessions and pods get created
+
+- A vcjob has no pods until the PodGroup is `Inqueue`. In the admission session reclaim finds no
+  tasks, the verdict is `ReclaimNotAttempted`, dequeue does nothing, the phase persists as
+  `Inqueue`, the job controller creates the pods, and only the next session yields a real verdict.
+  The trial is therefore not a dry run for vcjobs: pods exist for at least one session, the
+  reservation lasts that long, and autoscalers see Pending pods.
+- If the pods never appear or are all scheduling-gated, reclaim skips the job every session and no
+  verdict is ever produced. Only the opt-in `inqueueTimeout` covers this. Follow-up: treat a tagged
+  group with `ReclaimNotAttempted` for N consecutive sessions as a failed trial, or document the
+  timeout as mandatory for vcjob users.
+- On a dequeue the created pods are not deleted; they stay Pending until re-admission.
+- The verdict is per job but reclaim commits per gang: if some tasks pipeline but fewer than
+  minAvailable, the statement is discarded while the verdict reads `ReclaimSucceeded`, so dequeue
+  leaves the job `Inqueue`. Follow-up: a verdict that reflects the gang outcome.
+
+### Asks reclaim refuses to evaluate
+
+- A pod with `preemptionPolicy: Never`, or a pre-predicate failure, is skipped before the attempt is
+  counted. The job is admitted, tagged, never gets a verdict, and stays `Inqueue`. Follow-up: the
+  gate refuses the relaxed admission when the job's pending tasks carry `PreemptNever`.
+- A leaf with no `deserved` never passes the entitlement check and never uses the relaxed path.
+  By design; document.
+
+### Order and configuration
+
+- The guard checks that dequeue is enabled, not that it runs after reclaim. With dequeue before
+  reclaim every verdict it sees is `ReclaimNotAttempted` and nothing is reverted. Follow-up:
+  validate the action order in the scheduler configuration loader (`pkg/scheduler/scheduler.go`,
+  where the action list is parsed). Not a priority.
+- Other enqueue voters still reject before the trial starts (`overcommit` on a full cluster, `sla`,
+  `resourcequota`, `extender`). Expected; document.
+
+### Lost work and churn
+
+- Pipelining is not persisted across sessions and Volcano has no node reservation. After a
+  successful trial the victims drain; if another pod takes the freed space first, the next session
+  finds no victims left and dequeues the asker. The evictions were spent for nothing. Pre-existing
+  Volcano behavior (YuniKorn reserves the node for the ask); the trial adds the dequeue on top.
+- Two jobs admitted in one session can compete for the same victims; the second finds them already
+  terminating, gets `ReclaimNoVictims`, and is dequeued, then retried after the backoff.
+- A hopeless but entitled job (G13's shape) is re-admitted every `enqueueBackoff`: one full reclaim
+  trial, two status writes and a `Dequeued` event per cycle. Follow-up: exponential backoff, which
+  needs an attempt counter carried in the `Dequeued` condition.
+- The gang plugin writes an `Unschedulable` condition and bumps the job-retries metric on every
+  failed session of an admitted job. Noise, not harm.
+
+### Preempt has no verdict
+
+- A job admitted on the elastic credit of its own queue is served by same-queue preemption, which
+  records no verdict. Dequeue leaves it alone; only the timeout applies. Follow-up: the same verdict
+  in the preempt action, with dequeue acting when neither action could serve the job.
+
+### The remaining structural limit
+
+- Reclaim frees quota only with victims on the node it is trying (G13). The trial recovers such a
+  job instead of leaving it stuck, but does not serve it. Follow-up: two-round reclaim (node fit,
+  then hierarchy headroom with victims from any node, dimension-aware, only after the node fits),
+  modeled on YuniKorn's `calculateAdditionalVictims`.
+
+### What the trial fixes that the estimate could not
+
+- Affinity, taints and node selectors the gate cannot see: the preempt-time node filter yields no
+  nodes, the verdict is `ReclaimNoVictims`, and the tag makes dequeue revert the admission
+  (volcano-sh/volcano#3373 acknowledged this as unsolved upstream).
