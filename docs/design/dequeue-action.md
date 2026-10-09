@@ -202,6 +202,47 @@ implemented yet.
     dequeued, G16 unchanged (no node fits physically, so no second round), and a two-tenant case
     where the sibling's pod on another node is chosen over an over-deserved pod of another tenant.
 
+### Victim choice across nodes: cost, not exemption
+
+- Reclaim is first-fit per node: it walks the candidate nodes in list order and commits on the
+  first node where the asker fits after evicting that node's admissible victims, sorted lowest
+  priority first. Priority therefore orders victims only within a node. A pod that is the only
+  reclaimable pod on an early node is evicted even when cheaper victims exist on the next node,
+  which is how a Spark driver gets reclaimed although its executors were available.
+- The hard filter (`volcano.sh/preemptable: "false"`) is the only protection today, and it is
+  user-settable: a tenant that labels everything never returns borrowed capacity, and no queue
+  setting overrides it. Guarantees of other queues become unenforceable.
+- Follow-up, designed but not implemented: evaluate every candidate node, keep each per-node
+  statement open, score the victim sets and commit the cheapest, modeled on YuniKorn's solution
+  score and kube-scheduler's preemption rule: the priority of the highest-priority victim first,
+  then the victim count; a node that fits without eviction scores zero. Priority then is a cost:
+  a high-priority driver is taken only when no cheaper node exists, and abusing a PriorityClass
+  buys "evicted last", never "never evicted". PriorityClasses are cluster-scoped and can be capped
+  per namespace with a ResourceQuota scope. The label stays a filter for the few pods that truly
+  need it and should not be grantable to users. The hierarchy round above would run on the chosen
+  node.
+
+### Reclaim retry throttle
+
+- A pipelined asker whose nominated node still carries terminating victims is Pending again next
+  session; if it does not fit yet, reclaim evicts again. Preempt already waits in that case
+  (`taskEligibleToPreempt`). Follow-up: skip an asker in reclaim while its nominated node has a
+  terminating pod evicted by the scheduler, counted as not attempted so the dequeue action leaves
+  it alone. A few lines; removes most double evictions before any node hold is considered.
+
+### External gangs: Spark
+
+- Spark's own Volcano integration (the `VolcanoFeatureStep`) and the PodGroup controller both put
+  the driver and all executors in one PodGroup with `minMember` 1: the controller names an
+  auto-created group after the controller owner reference, and executors are owned by the driver
+  pod, so plain spark-submit yields `podgroup-<driver UID>` for every pod with `minResources` equal
+  to the driver's request. The Spark operator gives the driver its own group (owned by the
+  SparkApplication) and the executors a shared one.
+- With gang's starving rule the job stops being starving once the driver runs, so executors never
+  trigger reclaim. Upstream workaround: take `jobStarving` from the priority plugin and disable
+  gang's. A `minMember` above one deadlocks the driver, which must run to create the executors;
+  Volcano has no placeholder mechanism for externally created pods.
+
 ### Gang actions and the reserve
 
 - gangpreempt and gangreclaim check queues on the simulated path: PrePredicate clones every
