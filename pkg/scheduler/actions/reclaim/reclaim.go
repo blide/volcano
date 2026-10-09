@@ -479,15 +479,10 @@ func reclaimeesOnNode(ssn *framework.Session, job *api.JobInfo, task *api.TaskIn
 }
 
 // reclaimerFitsOnNode verifies that, after the tentative evictions recorded so far, the reclaimer
-// both fits the node physically and is allocatable in its queue hierarchy.
-//
-// The queue check is what lets reclaim serve an ask that is starved by an ancestor queue's
-// capability rather than by node capacity (volcano-sh/volcano#4817): plugins' DeallocateFunc
-// handlers run on every tentative Evict, so the capacity plugin's per-queue (and per-ancestor)
-// allocated counters already reflect the victims chosen so far, and ssn.Allocatable observes
-// them. Without this term the loop stops as soon as the node has room, evicts nothing, and the
-// ask is refused by the same Allocatable check in the next allocate pass, forever.
-// This mirrors preemptorFitsOnNode in the preempt action.
+// both fits the node physically and is allocatable in its queue hierarchy. The queue term is what
+// lets reclaim serve an ask starved by an ancestor's capability rather than by node capacity
+// (volcano-sh/volcano#4817): every tentative Evict runs the plugins' DeallocateFunc handlers, so
+// ssn.Allocatable already sees the victims chosen so far. Mirrors preemptorFitsOnNode in preempt.
 func reclaimerFitsOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, node *api.NodeInfo, resreq, availableResources *api.Resource) bool {
 	return ssn.Allocatable(queue, task) &&
 		resreq.LessEqual(availableResources, api.Zero) &&

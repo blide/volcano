@@ -42,9 +42,8 @@ success, not a failure. A verdict is therefore only `ReclaimFailed` when the cur
 cannot serve the job, and the enqueue backoff covers the case where that state changes later.
 
 `ReclaimNoVictims` is ordinary waiting for capacity and leaves the job `Inqueue`, with one
-exception: a PodGroup the capacity plugin admitted past an ancestor's capability on reclaimable
-slack (`enqueueAncestorCapReclaim`) carries an `Inqueue` condition with reason
-`AncestorCapReclaim`. Its admission depended on reclaim, so `ReclaimNoVictims` means the premise is
+exception: a PodGroup the capacity plugin admitted past an ancestor's capability on entitlement
+(`enqueueAncestorCapReclaim`) carries an `Inqueue` condition with reason `AncestorCapReclaim`. Its admission depended on reclaim, so `ReclaimNoVictims` means the premise is
 false and the job is dequeued as well.
 
 ## Behavior

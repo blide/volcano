@@ -75,8 +75,8 @@ type capacityPlugin struct {
 	totalResource        *api.Resource
 	totalGuarantee       *api.Resource
 	ancestorReclaimLevel int
-	// enqueueAncestorCapReclaim admits a job whose only enqueue blocker is an ancestor capability
-	// when the ancestor's subtree holds enough reclaimable slack to serve it. Default false.
+	// enqueueAncestorCapReclaim admits a job that is entitled to its leaf's deserved and blocked only
+	// by an ancestor capability, so that the reclaim action can try to serve it. Default false.
 	enqueueAncestorCapReclaim bool
 	// admittedPastAncestorCap lists the jobs enqueueableViaAncestorReclaim admitted in this session,
 	// so JobEnqueuedFn can tag their PodGroup for the dequeue action.
@@ -469,6 +469,8 @@ func (cp *capacityPlugin) Name() string {
 
 func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 	cp.parseArguments()
+	cp.admittedPastAncestorCap = map[api.JobID]struct{}{}
+	cp.inqueueJobsByQueue = map[api.QueueID][]*api.JobInfo{}
 
 	// Prepare scheduling data for this session.
 	cp.totalResource.Add(ssn.TotalResource)
@@ -808,9 +810,9 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		}
 
 		if ok, blocker, resourceNames := cp.checkJobEnqueueableHierarchically(ssn, queue, job); !ok {
-			// The job is blocked by an ancestor's capability only. If configured, admit it when the
-			// ancestor's subtree holds enough reclaimable slack for reclaim to serve it; otherwise
-			// the job would stay Pending forever while an over-deserved sibling keeps the capacity.
+			// Blocked by an ancestor's capability only. If configured, admit the job on entitlement
+			// (its leaf stays within deserved) and let reclaim try to serve it; otherwise it would
+			// stay Pending forever while an over-deserved sibling keeps the capacity.
 			if cp.enqueueAncestorCapReclaim && hierarchyEnabled && blocker != queue.UID &&
 				cp.enqueueableViaAncestorReclaim(ssn, queue, job) {
 				return util.Permit
@@ -870,10 +872,10 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 				LastTransitionTime: metav1.Now(),
 				TransitionID:       string(ssn.UID),
 				Reason:             api.PodGroupInqueueReasonAncestorCapReclaim,
-				Message:            "admitted past an ancestor capability on reclaimable slack; served by the reclaim action",
+				Message:            "admitted past an ancestor capability on entitlement; the reclaim action tries to serve it",
 			}
 			if err := ssn.UpdatePodGroupCondition(job, cond); err != nil {
-				klog.Errorf("[capacity] failed to tag job <%s/%s> as admitted on reclaimable slack: %v", job.Namespace, job.Name, err)
+				klog.Errorf("[capacity] failed to tag job <%s/%s> as admitted for a reclaim trial: %v", job.Namespace, job.Name, err)
 			}
 		}
 		klog.V(5).Infof("job <%s/%s> enqueued", job.Namespace, job.Name)
@@ -1089,15 +1091,10 @@ func (cp *capacityPlugin) parseArguments() {
 	cp.ancestorReclaimLevel = ancestorReclaimLevel
 	klog.V(4).Infof("[capacity] reclaim ancestor level configured as %d", cp.ancestorReclaimLevel)
 
-	enqueueAncestorCapReclaim := false
-	cp.pluginArguments.GetBool(&enqueueAncestorCapReclaim, enqueueAncestorCapReclaimKey)
-	cp.enqueueAncestorCapReclaim = enqueueAncestorCapReclaim
-	klog.V(4).Infof("[capacity] %s configured as %t", enqueueAncestorCapReclaimKey, cp.enqueueAncestorCapReclaim)
-
-	reserveDeserved := false
-	cp.pluginArguments.GetBool(&reserveDeserved, reserveDeservedKey)
-	cp.reserveDeserved = reserveDeserved
-	klog.V(4).Infof("[capacity] %s configured as %t", reserveDeservedKey, cp.reserveDeserved)
+	cp.pluginArguments.GetBool(&cp.enqueueAncestorCapReclaim, enqueueAncestorCapReclaimKey)
+	cp.pluginArguments.GetBool(&cp.reserveDeserved, reserveDeservedKey)
+	klog.V(4).Infof("[capacity] %s configured as %t, %s configured as %t",
+		enqueueAncestorCapReclaimKey, cp.enqueueAncestorCapReclaim, reserveDeservedKey, cp.reserveDeserved)
 }
 
 func (cp *capacityPlugin) getReclaimeeAncestorToCheck(reclaimerAttr, reclaimeeAttr *queueAttr, level int) (*queueAttr, bool) {
@@ -1278,7 +1275,6 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bool {
 	// Set the root queue
 	cp.rootQueue = rootQueueID
-	cp.inqueueJobsByQueue = make(map[api.QueueID][]*api.JobInfo)
 
 	// Initialize queue attributes
 	for _, queue := range ssn.Queues {
@@ -1665,16 +1661,6 @@ func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.
 	return cp.queueAllocatableWithReserved(attr, candidate, queue, nil, draEnabled, consumableCapacityEnabled)
 }
 
-// queueAllocatableForPath is queueAllocatable for a queue on the candidate's ancestor path: with
-// reserveDeserved, the queue's capability is also charged with the deserved share its other
-// subtrees are owed (reservedByOthers). pathChild is the child on the path to the candidate's
-// leaf; empty for the leaf itself.
-func (cp *capacityPlugin) queueAllocatableForPath(queue *api.QueueInfo, pathChild api.QueueID, candidate *api.TaskInfo) bool {
-	attr := cp.queueOpts[queue.UID]
-	return cp.queueAllocatableWithReserved(attr, candidate, queue, cp.reservedByOthers(attr, pathChild),
-		cp.dynamicResourceAllocationEnable, cp.draConsumableCapacityEnable)
-}
-
 // addTaskToReservedCache adds a task to the reserved cache
 // This should be called when a task passes capacity checks
 func (cp *capacityPlugin) addTaskToReservedCache(queueID api.QueueID, task *api.TaskInfo) {
@@ -1766,13 +1752,16 @@ func (cp *capacityPlugin) queueAllocatableWithReserved(attr *queueAttr, candidat
 func (cp *capacityPlugin) checkQueueAllocatableHierarchically(ssn *framework.Session, queue *api.QueueInfo, candidate *api.TaskInfo) bool {
 	// If hierarchical queue is not enabled, list will only contain the queue itself.
 	list := append(cp.queueOpts[queue.UID].ancestors, queue.UID)
-	// Check whether the candidate task can be allocated to the queue and all its ancestors.
+	// Check whether the candidate task can be allocated to the queue and all its ancestors. With
+	// reserveDeserved, each ancestor is also charged with the deserved share owed to subtrees other
+	// than the one on the path to the candidate (list[i+1]).
 	for i := len(list) - 1; i >= 0; i-- {
-		var pathChild api.QueueID
-		if i < len(list)-1 {
-			pathChild = list[i+1]
+		attr := cp.queueOpts[list[i]]
+		var reservedByOthers *api.Resource
+		if cp.reserveDeserved && i < len(list)-1 {
+			reservedByOthers = api.ExceededPart(attr.reserve, cp.queueOpts[list[i+1]].reserve)
 		}
-		if !cp.queueAllocatableForPath(ssn.Queues[list[i]], pathChild, candidate) {
+		if !cp.queueAllocatableWithReserved(attr, candidate, ssn.Queues[list[i]], reservedByOthers, cp.dynamicResourceAllocationEnable, cp.draConsumableCapacityEnable) {
 			// If log level is 5, print the information of all queues from leaf to ancestor.
 			if klog.V(5).Enabled() {
 				for j := i - 1; j >= 0; j-- {
@@ -1837,21 +1826,17 @@ func (cp *capacityPlugin) checkJobEnqueueableHierarchically(ssn *framework.Sessi
 }
 
 // enqueueableViaAncestorReclaim decides whether a job that failed checkJobEnqueueableHierarchically
-// may be enqueued anyway so that the reclaim action can try to serve it (volcano-sh/volcano#4817,
-// enqueue-side form). It establishes entitlement only and does not predict reclaim:
+// is entitled to be enqueued anyway for a reclaim trial (volcano-sh/volcano#4817). It does not
+// predict reclaim; it checks entitlement on every requested dimension:
 //
-//  1. the leaf passes its own enqueue check unchanged (its realCapability is never relaxed);
-//  2. the leaf stays at or under its deserved after admission on every requested dimension:
-//     allocated + inqueue + minReq <= deserved, with no elastic credit, and a requested dimension
-//     missing from deserved counts as zero;
-//  3. every ancestor that fails its check fails only on realCapability (a DRA failure still rejects).
+//  1. the leaf passes its own enqueue check unchanged;
+//  2. the leaf stays within its deserved after admission: allocated + inqueue + minReq <= deserved,
+//     with no elastic credit (a dimension missing from deserved counts as zero);
+//  3. every failing ancestor fails only on realCapability (a DRA failure still rejects).
 //
-// Admission is a trial. The job is tagged (JobEnqueuedFn writes the Inqueue condition with reason
-// AncestorCapReclaim), the reclaim action tries to serve it in the same session, and the dequeue
-// action returns it to Pending when reclaim reports that it cannot (ReclaimFailed, or
-// ReclaimNoVictims for a tagged job). A failed trial commits nothing but those conditions and one
-// session of inqueue reservation. The dequeue action must therefore be enabled; without it the
-// relaxed path is refused and the strict gate's verdict stands.
+// JobEnqueuedFn tags the admitted job (Inqueue condition, reason AncestorCapReclaim) and the dequeue
+// action reverts the admission when reclaim reports that it cannot serve the job, so the relaxed
+// path is refused when that action is not enabled.
 func (cp *capacityPlugin) enqueueableViaAncestorReclaim(ssn *framework.Session, queue *api.QueueInfo, job *api.JobInfo) bool {
 	if !conf.EnabledActionMap[conf.DequeueActionName] {
 		if !cp.warnedNoDequeue {
@@ -1901,9 +1886,6 @@ func (cp *capacityPlugin) enqueueableViaAncestorReclaim(ssn *framework.Session, 
 			enqueueAncestorCapReclaimKey, job.Namespace, job.Name, ancestorAttr.name, ancestorAttr.realCapability, future)
 	}
 
-	if cp.admittedPastAncestorCap == nil {
-		cp.admittedPastAncestorCap = map[api.JobID]struct{}{}
-	}
 	cp.admittedPastAncestorCap[job.UID] = struct{}{}
 	return true
 }
@@ -2155,45 +2137,45 @@ func jobUnplaced(job *api.JobInfo) *api.Resource {
 	return job.DeductSchGatedResources(util.GetInqueueResource(job, placed))
 }
 
-// leafOwed is the deserved share a leaf is still owed given its unplaced admitted demand:
-// clamp0(min(deserved, allocated + unplaced) - allocated) per dimension. A dimension missing from
-// deserved is owed nothing; dimensions are taken from unplaced.
-func leafOwed(deserved, allocated, unplaced *api.Resource) *api.Resource {
-	owed := api.EmptyResource()
-	dim := func(d, a, u float64) float64 { return math.Max(0, math.Min(d, a+u)-a) }
-	owed.MilliCPU = dim(deserved.MilliCPU, allocated.MilliCPU, unplaced.MilliCPU)
-	owed.Memory = dim(deserved.Memory, allocated.Memory, unplaced.Memory)
-	for name, u := range unplaced.ScalarResources {
-		if v := dim(deserved.Get(name), allocated.Get(name), u); v > 0 {
-			owed.SetScalar(name, v)
+// perDimension applies f to the cpu, memory and every scalar dimension named by any of the three
+// operands, keeping the positive results.
+func perDimension(a, b, c *api.Resource, f func(a, b, c float64) float64) *api.Resource {
+	out := api.EmptyResource()
+	out.MilliCPU = f(a.MilliCPU, b.MilliCPU, c.MilliCPU)
+	out.Memory = f(a.Memory, b.Memory, c.Memory)
+	for _, r := range []*api.Resource{a, b, c} {
+		for name := range r.ScalarResources {
+			if v := f(a.Get(name), b.Get(name), c.Get(name)); v > 0 {
+				out.SetScalar(name, v)
+			}
 		}
 	}
-	return owed
+	return out
 }
 
-// parentReserve folds the children's reserves: min(sum of children, clamp0(deserved - allocated))
-// per dimension. A dimension on which the parent has no deserved passes the children's sum
-// through, since the parent has no guarantee of its own to cap it with.
-func parentReserve(deserved, allocated *api.Resource, children []*api.Resource) *api.Resource {
+// leafOwed is the deserved share a leaf is still owed given its unplaced admitted demand:
+// clamp0(min(deserved, allocated + unplaced) - allocated). A dimension missing from deserved is
+// owed nothing.
+func leafOwed(deserved, allocated, unplaced *api.Resource) *api.Resource {
+	return perDimension(deserved, allocated, unplaced, func(d, a, u float64) float64 {
+		return math.Max(0, math.Min(d, a+u)-a)
+	})
+}
+
+// parentReserve folds the children's reserves: min(sum of children, clamp0(deserved - allocated)).
+// A dimension on which the parent has no deserved passes the children's sum through, since the
+// parent has no guarantee of its own to cap it with.
+func parentReserve(attr *queueAttr) *api.Resource {
 	sum := api.EmptyResource()
-	for _, c := range children {
-		sum.Add(c)
+	for _, child := range attr.children {
+		sum.Add(child.reserve)
 	}
-	capped := func(d, a, s float64) float64 {
+	return perDimension(attr.deserved, attr.allocated, sum, func(d, a, s float64) float64 {
 		if d <= 0 {
 			return s
 		}
 		return math.Max(0, math.Min(s, d-a))
-	}
-	res := api.EmptyResource()
-	res.MilliCPU = capped(deserved.MilliCPU, allocated.MilliCPU, sum.MilliCPU)
-	res.Memory = capped(deserved.Memory, allocated.Memory, sum.Memory)
-	for name, v := range sum.ScalarResources {
-		if r := capped(deserved.Get(name), allocated.Get(name), v); r > 0 {
-			res.SetScalar(name, r)
-		}
-	}
-	return res
+	})
 }
 
 func (cp *capacityPlugin) leafReserve(attr *queueAttr) *api.Resource {
@@ -2202,14 +2184,6 @@ func (cp *capacityPlugin) leafReserve(attr *queueAttr) *api.Resource {
 		unplaced.Add(jobUnplaced(job))
 	}
 	return leafOwed(attr.deserved, attr.allocated, unplaced)
-}
-
-func (cp *capacityPlugin) childReserves(attr *queueAttr) []*api.Resource {
-	reserves := make([]*api.Resource, 0, len(attr.children))
-	for _, child := range attr.children {
-		reserves = append(reserves, child.reserve)
-	}
-	return reserves
 }
 
 // rebuildReserves computes every queue's reserve bottom-up from the given subtree root.
@@ -2221,7 +2195,7 @@ func (cp *capacityPlugin) rebuildReserves(attr *queueAttr) {
 	for _, child := range attr.children {
 		cp.rebuildReserves(child)
 	}
-	attr.reserve = parentReserve(attr.deserved, attr.allocated, cp.childReserves(attr))
+	attr.reserve = parentReserve(attr)
 	klog.V(5).Infof("[capacity] queue <%s> reserve <%v>", attr.name, attr.reserve)
 }
 
@@ -2230,32 +2204,8 @@ func (cp *capacityPlugin) rebuildReserves(attr *queueAttr) {
 func (cp *capacityPlugin) refreshReserve(leaf *queueAttr) {
 	leaf.reserve = cp.leafReserve(leaf)
 	for i := len(leaf.ancestors) - 1; i >= 0; i-- {
-		anc := cp.queueOpts[leaf.ancestors[i]]
-		if anc == nil {
-			continue
-		}
-		anc.reserve = parentReserve(anc.deserved, anc.allocated, cp.childReserves(anc))
-	}
-}
-
-// reservedByOthers is the share of attr's reserve owed to subtrees other than pathChild, which is
-// the child on the path to the candidate's leaf. The candidate's own subtree keeps its owed share
-// available to itself. nil when the feature is off or attr is the leaf.
-func (cp *capacityPlugin) reservedByOthers(attr *queueAttr, pathChild api.QueueID) *api.Resource {
-	if !cp.reserveDeserved || pathChild == "" {
-		return nil
-	}
-	child := cp.queueOpts[pathChild]
-	if child == nil {
-		return nil
-	}
-	others := attr.reserve.Clone().SubWithoutAssert(child.reserve)
-	others.MilliCPU = math.Max(0, others.MilliCPU)
-	others.Memory = math.Max(0, others.Memory)
-	for name, v := range others.ScalarResources {
-		if v < 0 {
-			others.ScalarResources[name] = 0
+		if anc := cp.queueOpts[leaf.ancestors[i]]; anc != nil {
+			anc.reserve = parentReserve(anc)
 		}
 	}
-	return others
 }

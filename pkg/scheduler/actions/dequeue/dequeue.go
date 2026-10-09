@@ -16,13 +16,7 @@ limitations under the License.
 
 // Package dequeue implements the dequeue action: it moves a PodGroup from Inqueue back to Pending
 // when the reclaim action reports that it cannot serve it, releasing the PodGroup's queue
-// reservation instead of holding it indefinitely.
-//
-// A PodGroup that reaches Inqueue reserves its minResources against its queue and every ancestor
-// (the capacity and proportion plugins' inqueue accounting), and for Volcano Jobs it triggers pod
-// creation. Nothing in the scheduler ever moves a PodGroup back from Inqueue: the phase stays until
-// minMember tasks are scheduled. A group that cannot be served therefore holds its reservation
-// forever and starves its queue's siblings.
+// reservation instead of holding it forever (see docs/design/dequeue-action.md).
 //
 // The action runs after reclaim and reads reclaim's per-session verdict (api.JobInfo.ReclaimResult):
 //
@@ -90,9 +84,9 @@ type Action struct {
 	inqueueTimeout time.Duration
 }
 
-// New returns the action instance.
+// New returns the action instance. Arguments are parsed on every Execute.
 func New() *Action {
-	return &Action{enqueueBackoff: DefaultEnqueueBackoff}
+	return &Action{}
 }
 
 // Name returns the action name.
@@ -181,7 +175,7 @@ func (a *Action) Execute(ssn *framework.Session) {
 				"reclaim found victims but could not make any node fit the job; moved back to Pending and released the queue reservation")
 		case job.ReclaimResult == api.ReclaimNoVictims && admittedOnReclaim:
 			a.dequeue(ssn, job, DequeuedReasonReclaimFailed,
-				"admitted on reclaimable slack but reclaim found no eligible victim; moved back to Pending and released the queue reservation")
+				"admitted for a reclaim trial but reclaim found no eligible victim; moved back to Pending and released the queue reservation")
 		case a.inqueueTimeout > 0:
 			a.applyTimeout(ssn, job, inqueueCond, now)
 		}

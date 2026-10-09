@@ -203,15 +203,21 @@ func getTaskRole(pod *v1.Pod) string {
 
 const TaskPriorityAnnotation = "volcano.sh/task-priority"
 
+// PodGroup conditions shared by the capacity plugin and the dequeue action.
 const (
-	// PodGroupInqueueType is a PodGroup condition recorded by the dequeue action the first time it
-	// observes a PodGroup Inqueue without any scheduled task. Its LastTransitionTime is the clock
-	// the dequeue action compares against its inqueueTimeout. Status False marks a dequeued group.
+	// PodGroupInqueueType records why and when a PodGroup is Inqueue without any scheduled task.
+	// The capacity plugin writes it at admission with reason PodGroupInqueueReasonAncestorCapReclaim;
+	// the dequeue action writes it on first sight when its timeout lane is on, and compares its
+	// LastTransitionTime with inqueueTimeout. The dequeue action sets it False when it dequeues.
 	PodGroupInqueueType scheduling.PodGroupConditionType = "Inqueue"
 	// PodGroupDequeuedType is set by the dequeue action when it moves a PodGroup from Inqueue back
 	// to Pending. The enqueue action keeps the group Pending while this condition is younger than
 	// the dequeue action's enqueueBackoff.
 	PodGroupDequeuedType scheduling.PodGroupConditionType = "Dequeued"
+	// PodGroupInqueueReasonAncestorCapReclaim on the Inqueue condition marks a PodGroup the capacity
+	// plugin admitted past an ancestor's capability on entitlement, for the reclaim action to serve.
+	// Its admission is reverted by the dequeue action when reclaim reports that it cannot.
+	PodGroupInqueueReasonAncestorCapReclaim = "AncestorCapReclaim"
 )
 
 // NewTaskInfo creates new taskInfo object for a Pod
@@ -504,15 +510,8 @@ const (
 	// fit the job (physically and in its queue hierarchy), so every tentative eviction was rolled
 	// back. Reclaim cannot serve the job in the current cluster state.
 	ReclaimFailed
-	// ReclaimSucceeded: the job was pipelined by reclaim in this session.
+	// ReclaimSucceeded: reclaim pipelined a task of the job in this session and committed it.
 	ReclaimSucceeded
-)
-
-const (
-	// PodGroupInqueueReasonAncestorCapReclaim on the Inqueue condition marks a PodGroup that the
-	// capacity plugin admitted past an ancestor's capability on the strength of reclaimable slack.
-	// Its admission depends on reclaim serving it.
-	PodGroupInqueueReasonAncestorCapReclaim = "AncestorCapReclaim"
 )
 
 // NewJobInfo creates a new jobInfo for set of tasks
