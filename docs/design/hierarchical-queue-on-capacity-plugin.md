@@ -393,6 +393,38 @@ graph TD
 
 **Note:** The above modifications are primarily applicable when `EnabledHierarchy` is set to true. If the capacity plugin does not require hierarchical queue management, the existing implementations of these functions will be retained.
 
+### Reserving the deserved share of admitted jobs
+
+Plugin argument `reserveDeserved` (default `false`). Without it, `deserved` is enforced only by reclaim:
+the allocatable check compares `allocated + request` with `realCapability` at the leaf and every
+ancestor, and an over-deserved queue can consume a parent's capability that an under-deserved sibling
+with an admitted job is waiting for. Right after a reclaim this lets the victim's replacement take the
+freed space ahead of the job the eviction served.
+
+With the argument on, every `queueAttr` carries a `reserve`, rebuilt per session and kept live by the
+allocate and deallocate event handlers (and the job-enqueued handler for jobs admitted in-session):
+
+```
+leaf:   reserve = clamp0(min(deserved, allocated + unplaced) - allocated)         per dimension
+        unplaced = Σ over Inqueue jobs with minResources of
+                   clamp0(minResources - resources of tasks in allocated status or Pipelined)
+                   (gated pods deducted as for the inqueue term)
+parent: reserve = min(Σ children.reserve, clamp0(deserved - allocated))           per dimension
+        (a dimension with no deserved on the parent passes the children's sum through)
+```
+
+`checkQueueAllocatableHierarchically` then charges each ancestor on the candidate's path with
+`clamp0(ancestor.reserve - pathChild.reserve)`:
+
+```
+allocated + queueGateReserved + request + reservedByOthers <= realCapability
+```
+
+on the candidate's dimensions. The leaf check is unchanged, and the candidate's own subtree keeps its
+owed share available to itself. The reservation is not a node reservation: two queues both within
+their `deserved` still compete for a freed node slot in queue order. The simulated allocatable check
+used by the gangpreempt and gangreclaim actions does not charge the reserve.
+
 ### Vcctl
 
 - Design relevant vcctl commands, such as commands to obtain the child queues of a specific queue or commands to retrieve the entire hierarchical queue structure.

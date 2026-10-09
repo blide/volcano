@@ -91,6 +91,10 @@ data:
           # reclaim can free. Default false. See "Configure enqueue admission on reclaimable
           # ancestor capacity" below.
           enqueueAncestorCapReclaim: true
+          # Charge every ancestor's capability with the deserved share its other subtrees are
+          # still owed by admitted jobs. Default false. See "Reserve the deserved share of
+          # admitted jobs" below.
+          reserveDeserved: true
       - name: nodeorder
       - name: binpack
 ```
@@ -143,6 +147,37 @@ in the sessions after the pods appear. Two settings make this usable:
 
 Without the feature gate the pods are created ungated, which works but exposes them as `Unschedulable`
 to autoscalers during the trial.
+
+## Reserve the deserved share of admitted jobs
+
+A queue's `deserved` is its guaranteed share, but by default it is enforced only after the fact, by the
+`reclaim` action evicting an over-deserved queue. The allocatable check that every task passes looks at
+`capability` alone, so an over-deserved queue can keep growing into a parent's capability while an
+under-deserved sibling has an admitted (`Inqueue`) job waiting for that very space. The most common
+case is the session after a successful reclaim: the evicted pod's replacement is admitted at the shared
+parent before the job the eviction was made for, the job evicts again or finds nothing left to evict,
+and the eviction was spent for nothing.
+
+Setting the plugin argument `reserveDeserved: true` (hierarchy mode only, default `false`) makes the
+allocatable check honor the share the hierarchy still owes:
+
+- a leaf is owed `min(deserved, allocated + unplaced) - allocated` per resource dimension, where
+  `unplaced` is the `minResources` of its `Inqueue` PodGroups that no allocated or pipelined task holds
+  yet. A PodGroup without `minResources`, or one that is `Pending` (for example dequeued), is owed nothing;
+- a parent is owed the sum over its children, capped by its own `deserved - allocated`;
+- at every ancestor of a candidate task's queue, the check becomes
+  `allocated + request + (owed by the ancestor - owed by the child on the path to the candidate) <= capability`.
+  The candidate's own subtree never pays for its own reservation. The leaf check is unchanged.
+
+With the example above the replacement pod is refused at the parent for as long as the admitted job is
+owed its share, on every node and in every session, and the job takes the freed space. The reservation
+ends when the job is placed, or when the [dequeue action](../design/dequeue-action.md) returns it to
+`Pending`. Two queues that are both within their `deserved` are not protected from each other: which of
+them gets a freed node slot first is decided by queue order.
+
+The reservation never exceeds a parent's own `deserved`, so a child whose `deserved` exceeds what its
+parent guarantees is reserved only the parent's remainder. Flat queues are not affected: the root has no
+`capability` unless one is set.
 
 ## Choose the cheapest victims across nodes
 

@@ -159,8 +159,13 @@ implemented yet.
 
 - Pipelining is not persisted across sessions and Volcano has no node reservation. After a
   successful trial the victims drain; if another pod takes the freed space first, the next session
-  finds no victims left and dequeues the asker. The evictions were spent for nothing. Pre-existing
-  Volcano behavior (YuniKorn reserves the node for the ask); the trial adds the dequeue on top.
+  finds no victims left and dequeues the asker. The evictions were spent for nothing. The capacity
+  plugin's `reserveDeserved` argument closes the common case: while the asker is owed its deserved
+  share, every ancestor refuses candidates from other subtrees (the victim's replacement above
+  all) that would consume it. What remains is the node-level race between two queues both within
+  their deserved, decided by queue order. Follow-up: a node hold derived from the nomination the
+  cache already writes after an eviction-backed pipeline (`pod.Status.NominatedNodeName`), the way
+  YuniKorn reserves the node for the ask.
 - Two jobs admitted in one session can compete for the same victims; the second finds them already
   terminating, gets `ReclaimNoVictims`, and is dequeued, then retried after the backoff.
 - A hopeless but entitled job (G13's shape) is re-admitted every `enqueueBackoff`: one full reclaim
