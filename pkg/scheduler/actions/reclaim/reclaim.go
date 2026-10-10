@@ -189,23 +189,7 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 	for _, n := range predicateNodesByShardFlattened {
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.", task.Namespace, task.Name, n.Name)
 
-		var reclaimees []*api.TaskInfo
-		for _, taskOnNode := range n.Tasks {
-			if taskOnNode.Status != api.Running || !taskOnNode.Preemptable {
-				continue
-			}
-
-			if j, found := ssn.Jobs[taskOnNode.Job]; !found {
-				continue
-			} else if j.Queue != job.Queue {
-				q := ssn.Queues[j.Queue]
-				if !q.Reclaimable() {
-					continue
-				}
-				reclaimees = append(reclaimees, taskOnNode.Clone())
-			}
-		}
-
+		reclaimees := reclaimeesOnNode(ssn, job, task, n)
 		if len(reclaimees) == 0 {
 			klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
 			continue
@@ -259,6 +243,37 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		stmt.Merge(nodeStmt)
 		break
 	}
+}
+
+// reclaimeesOnNode lists the Running, preemptable tasks on node that belong to another, reclaimable
+// queue than job's, ordered cheapest victim first (the victims-queue order: queue order, then job
+// order, then lowest task priority). Plugins that admit victims in arrival order, such as the gang
+// plugin's minAvailable veto, then spend their admissions on the cheap tasks and veto the expensive
+// ones, instead of whatever the node's task map yields first.
+func reclaimeesOnNode(ssn *framework.Session, job *api.JobInfo, task *api.TaskInfo, node *api.NodeInfo) []*api.TaskInfo {
+	var reclaimees []*api.TaskInfo
+	for _, taskOnNode := range node.Tasks {
+		if taskOnNode.Status != api.Running || !taskOnNode.Preemptable {
+			continue
+		}
+		j, found := ssn.Jobs[taskOnNode.Job]
+		if !found || j.Queue == job.Queue {
+			continue
+		}
+		if q := ssn.Queues[j.Queue]; q == nil || !q.Reclaimable() {
+			continue
+		}
+		reclaimees = append(reclaimees, taskOnNode.Clone())
+	}
+	if len(reclaimees) < 2 {
+		return reclaimees
+	}
+	ordered := make([]*api.TaskInfo, 0, len(reclaimees))
+	queue := ssn.BuildVictimsPriorityQueue(reclaimees, task)
+	for !queue.Empty() {
+		ordered = append(ordered, queue.Pop().(*api.TaskInfo))
+	}
+	return ordered
 }
 
 // reclaimerFitsOnNode verifies available resources and plugin predicates after tentative evictions.

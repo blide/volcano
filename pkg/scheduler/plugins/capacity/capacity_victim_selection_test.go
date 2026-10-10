@@ -1,0 +1,238 @@
+/*
+Copyright 2026 The Volcano Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package capacity
+
+import (
+	"strconv"
+	"testing"
+
+	corev1 "k8s.io/api/core/v1"
+	schedulingv1 "k8s.io/api/scheduling/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	schedulingv1beta1 "volcano.sh/apis/pkg/apis/scheduling/v1beta1"
+	"volcano.sh/volcano/pkg/scheduler/actions/allocate"
+	"volcano.sh/volcano/pkg/scheduler/actions/enqueue"
+	"volcano.sh/volcano/pkg/scheduler/actions/reclaim"
+	"volcano.sh/volcano/pkg/scheduler/api"
+	"volcano.sh/volcano/pkg/scheduler/conf"
+	"volcano.sh/volcano/pkg/scheduler/framework"
+	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
+	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
+	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
+	"volcano.sh/volcano/pkg/scheduler/uthelper"
+	"volcano.sh/volcano/pkg/scheduler/util"
+)
+
+// Victim selection by the reclaim action under hierarchical capacity queues: which of a node's
+// victims are offered to the plugins first, and which node's victims are committed. The fixture
+// is a tenant failing over: queue active drains (deserved 0 where the case says so) while queue
+// standby asks for its share, with other tenants next to it where the case needs them.
+
+const vsNS = "ns1"
+
+// vsCase is one scheduling session: pods and nodes, the queue tree, plugin switches, the reclaim
+// action's arguments, and the expected binds, pipelines and evictions.
+type vsCase struct {
+	uthelper.TestCommonStruct
+	// priority enables the priority plugin's job and task order (victim cost is pod priority).
+	priority bool
+	// gangReclaim enables gang's ReclaimableFn (the minAvailable veto).
+	gangReclaim bool
+	// actions overrides the action sequence; the default is enqueue, reclaim, allocate.
+	actions []framework.Action
+	// check runs extra assertions on the session after CheckAll.
+	check func(t *testing.T, ssn *framework.Session)
+}
+
+func vsRes(c string) corev1.ResourceList {
+	if c == "" {
+		return nil
+	}
+	return api.BuildResourceList(c, c+"Gi")
+}
+
+func vsNode(name, c string) *corev1.Node {
+	return util.BuildNode(name, api.BuildResourceList(c, c+"Gi", []api.ScalarResource{{Name: "pods", Value: "10"}}...), map[string]string{})
+}
+
+func vsQueue(name, parent, deserved, capability string) *schedulingv1beta1.Queue {
+	return buildQueueWithParents(name, parent, vsRes(deserved), vsRes(capability))
+}
+
+func vsPreemptable(preemptable bool) map[string]string {
+	return map[string]string{schedulingv1beta1.PodPreemptable: strconv.FormatBool(preemptable)}
+}
+
+// vsRunning is a Running pod on node; prio nil leaves the pod without a priority.
+func vsRunning(name, pg, node, c string, preemptable bool, prio *int32) *corev1.Pod {
+	return util.BuildPodWithPriority(vsNS, name, node, corev1.PodRunning, vsRes(c), pg, vsPreemptable(preemptable), map[string]string{}, prio)
+}
+
+func vsPending(name, pg, c string) *corev1.Pod {
+	return util.BuildPod(vsNS, name, "", corev1.PodPending, vsRes(c), pg, map[string]string{}, map[string]string{})
+}
+
+// vsNominated is a pending ask that a previous session's reclaim pipelined on node after
+// evicting for it: the cache wrote the node into the pod's nominatedNodeName.
+func vsNominated(name, pg, c, node string) *corev1.Pod {
+	pod := vsPending(name, pg, c)
+	pod.Status.NominatedNodeName = node
+	return pod
+}
+
+// vsEvicted is a victim the scheduler evicted in a previous session that is still terminating on
+// node: deletion timestamp set, DisruptionTarget condition as Volcano's evictor writes it.
+func vsEvicted(name, pg, node, c string) *corev1.Pod {
+	pod := vsRunning(name, pg, node, c, true, nil)
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+	pod.Status.Conditions = append(pod.Status.Conditions, corev1.PodCondition{
+		Type:   corev1.DisruptionTarget,
+		Status: corev1.ConditionTrue,
+		Reason: corev1.PodReasonPreemptionByScheduler,
+	})
+	return pod
+}
+
+func vsRunningPG(name, queue string) *schedulingv1beta1.PodGroup {
+	return util.BuildPodGroup(name, vsNS, queue, 1, nil, schedulingv1beta1.PodGroupRunning)
+}
+
+func vsAskPG(name, queue string) *schedulingv1beta1.PodGroup {
+	return util.BuildPodGroup(name, vsNS, queue, 1, nil, schedulingv1beta1.PodGroupInqueue)
+}
+
+// vsTree is root -> tenant -> {active, standby}; the strings are deserved and capability.
+func vsTree(tenantDeserved, tenantCap, activeDeserved, activeCap, standbyDeserved, standbyCap string) []*schedulingv1beta1.Queue {
+	return []*schedulingv1beta1.Queue{
+		vsQueue("root", "", "", ""),
+		vsQueue("tenant", "root", tenantDeserved, tenantCap),
+		vsQueue("active", "tenant", activeDeserved, activeCap),
+		vsQueue("standby", "tenant", standbyDeserved, standbyCap),
+	}
+}
+
+// vsTwoTenants is a second tenant next to the failover one. t1 is failing over: active1 drains
+// (deserved 0) while standby1 ramps; t2 is a plain tenant over its deserved.
+func vsTwoTenants() []*schedulingv1beta1.Queue {
+	return []*schedulingv1beta1.Queue{
+		vsQueue("root", "", "", ""),
+		vsQueue("t1", "root", "4", "10"),
+		vsQueue("active1", "t1", "0", "10"),
+		vsQueue("standby1", "t1", "4", "10"),
+		vsQueue("t2", "root", "3", "8"),
+		vsQueue("active2", "t2", "0", "8"),
+	}
+}
+
+func (c vsCase) tiers() []conf.Tier {
+	trueValue := true
+	opts := []conf.PluginOption{
+		{
+			Name:               PluginName,
+			EnabledAllocatable: &trueValue,
+			EnablePreemptive:   &trueValue,
+			EnabledReclaimable: &trueValue,
+			EnabledQueueOrder:  &trueValue,
+			EnabledHierarchy:   &trueValue,
+			EnabledJobEnqueued: &trueValue,
+		},
+		{Name: predicates.PluginName, EnabledPredicate: &trueValue},
+	}
+	gangOpt := conf.PluginOption{Name: gang.PluginName, EnabledJobStarving: &trueValue}
+	if c.gangReclaim {
+		gangOpt.EnabledReclaimable = &trueValue
+	}
+	opts = append(opts, gangOpt)
+	if c.priority {
+		opts = append(opts, conf.PluginOption{
+			Name:             priority.PluginName,
+			EnabledJobOrder:  &trueValue,
+			EnabledTaskOrder: &trueValue,
+		})
+	}
+	return []conf.Tier{{Plugins: opts}}
+}
+
+func Test_capacityPlugin_ReclaimVictimSelection(t *testing.T) {
+	plugins := map[string]framework.PluginBuilder{
+		PluginName:            New,
+		predicates.PluginName: predicates.New,
+		gang.PluginName:       gang.New,
+		priority.PluginName:   priority.New,
+	}
+	defaultActions := []framework.Action{enqueue.New(), reclaim.New(), allocate.New()}
+
+	prioHigh, prioLow := int32(1000), int32(100)
+	pcHigh := util.BuildPriorityClass("high", prioHigh)
+	pcLow := util.BuildPriorityClass("low", prioLow)
+	priClasses := []*schedulingv1.PriorityClass{pcHigh, pcLow}
+
+	// tenant 4/4, active deserved 2 cap 4, standby deserved 2 cap 4: the tenant is full, active
+	// is over its deserved, standby asks for its share.
+	defaultTree := vsTree("4", "4", "2", "4", "2", "4")
+	pgActive := vsRunningPG("pg-active", "active")
+	pgStandby := vsAskPG("pg-standby", "standby")
+	standbyOnN1 := map[string][]string{"ns1/pg-standby": {"n1"}}
+
+	cases := []vsCase{
+		// ------------------------------------------------------- reclaimee order on a node
+		{
+			// Requirement. Gang's reclaim veto admits victims in arrival order until the job would
+			// drop below minAvailable: the job has two ready tasks and minAvailable 1, so exactly
+			// one victim is admitted and the other vetoed. Reclaim must hand the reclaimees over
+			// cheapest first, so the veto lands on the driver and never on the executor.
+			priority:    true,
+			gangReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "O1: with gang's veto the executor is evicted before the driver",
+				Pods: []*corev1.Pod{
+					vsRunning("driver-a", "pg-active", "n1", "2", true, &prioHigh),
+					vsRunning("exec-a", "pg-active", "n1", "2", true, &prioLow),
+					vsPending("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          defaultTree,
+				PriClass:        priClasses,
+				ExpectPipeLined: standbyOnN1,
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-a"},
+			},
+		},
+	}
+
+	for i, c := range cases {
+		t.Run(c.Name, func(t *testing.T) {
+			c.Plugins = plugins
+			ssn := c.RegisterSession(c.tiers(), nil)
+			defer c.Close()
+			actions := defaultActions
+			if c.actions != nil {
+				actions = c.actions
+			}
+			c.Run(actions)
+			if c.check != nil {
+				c.check(t, ssn)
+			}
+			if err := c.CheckAll(i); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
