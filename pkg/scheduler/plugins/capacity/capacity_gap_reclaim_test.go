@@ -41,6 +41,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/plugins/gang"
 	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
 	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
+	"volcano.sh/volcano/pkg/scheduler/plugins/quota"
 	"volcano.sh/volcano/pkg/scheduler/uthelper"
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
@@ -214,25 +215,32 @@ func (tr gapTree) queues() []*schedulingv1beta1.Queue {
 // the priority plugin when the case asks for it.
 func (c gapCase) tiers() []conf.Tier {
 	trueValue := true
+	// capacity keeps the share functions (queue and victim order, preemptive, reclaimable); the
+	// quota plugin owns the capability checks (allocatable, enqueue admission) and the arguments
+	// that go with them.
 	capacityOpt := conf.PluginOption{
 		Name:               PluginName,
-		EnabledAllocatable: &trueValue,
 		EnablePreemptive:   &trueValue,
 		EnabledReclaimable: &trueValue,
 		EnabledQueueOrder:  &trueValue,
 		EnabledHierarchy:   &trueValue,
-		EnabledJobEnqueued: &trueValue,
 	}
-	if c.level > 0 || c.enqueueReclaim || c.reserveDeserved {
-		capacityOpt.Arguments = framework.Arguments{}
-		if c.level > 0 {
-			capacityOpt.Arguments[ancestorReclaimLevelKey] = c.level
-		}
+	if c.level > 0 {
+		capacityOpt.Arguments = framework.Arguments{ancestorReclaimLevelKey: c.level}
+	}
+	quotaOpt := conf.PluginOption{
+		Name:               quota.PluginName,
+		EnabledAllocatable: &trueValue,
+		EnabledJobEnqueued: &trueValue,
+		EnabledHierarchy:   &trueValue,
+	}
+	if c.enqueueReclaim || c.reserveDeserved {
+		quotaOpt.Arguments = framework.Arguments{}
 		if c.enqueueReclaim {
-			capacityOpt.Arguments[enqueueAncestorCapReclaimKey] = true
+			quotaOpt.Arguments[quota.EnqueueAncestorCapReclaimKey] = true
 		}
 		if c.reserveDeserved {
-			capacityOpt.Arguments[reserveDeservedKey] = true
+			quotaOpt.Arguments[quota.ReserveDeservedKey] = true
 		}
 	}
 	gangOpt := conf.PluginOption{Name: gang.PluginName, EnabledJobStarving: &trueValue}
@@ -249,6 +257,7 @@ func (c gapCase) tiers() []conf.Tier {
 	}
 	opts := []conf.PluginOption{
 		capacityOpt,
+		quotaOpt,
 		{Name: predicates.PluginName, EnabledPredicate: &trueValue},
 		gangOpt,
 	}
@@ -269,6 +278,7 @@ func (c gapCase) tiers() []conf.Tier {
 func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 	plugins := map[string]framework.PluginBuilder{
 		PluginName:            New,
+		quota.PluginName:      quota.New,
 		predicates.PluginName: predicates.New,
 		gang.PluginName:       gang.New,
 		priority.PluginName:   priority.New,
@@ -1720,28 +1730,6 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 			}
 			if err := c.CheckAll(i); err != nil {
 				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func Test_capacityPlugin_parseEnqueueAncestorCapReclaim(t *testing.T) {
-	cases := []struct {
-		name string
-		args framework.Arguments
-		want bool
-	}{
-		{name: "default off", args: framework.Arguments{}, want: false},
-		{name: "enabled", args: framework.Arguments{enqueueAncestorCapReclaimKey: true}, want: true},
-		{name: "explicitly off", args: framework.Arguments{enqueueAncestorCapReclaimKey: false}, want: false},
-		{name: "invalid value falls back to off", args: framework.Arguments{enqueueAncestorCapReclaimKey: "nope"}, want: false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			cp := New(c.args).(*capacityPlugin)
-			cp.parseArguments()
-			if cp.enqueueAncestorCapReclaim != c.want {
-				t.Fatalf("%s=%v: want %t, got %t", enqueueAncestorCapReclaimKey, c.args[enqueueAncestorCapReclaimKey], c.want, cp.enqueueAncestorCapReclaim)
 			}
 		})
 	}

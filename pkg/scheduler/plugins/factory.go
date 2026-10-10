@@ -40,6 +40,7 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/plugins/predicates"
 	"volcano.sh/volcano/pkg/scheduler/plugins/priority"
 	"volcano.sh/volcano/pkg/scheduler/plugins/proportion"
+	"volcano.sh/volcano/pkg/scheduler/plugins/quota"
 	"volcano.sh/volcano/pkg/scheduler/plugins/rescheduling"
 	resourcestrategyfit "volcano.sh/volcano/pkg/scheduler/plugins/resource-strategy-fit"
 	"volcano.sh/volcano/pkg/scheduler/plugins/resourcequota"
@@ -76,6 +77,7 @@ func init() {
 	// Plugins for Queues
 	framework.RegisterPluginBuilder(proportion.PluginName, proportion.New)
 	framework.RegisterPluginBuilder(capacity.PluginName, capacity.New)
+	framework.RegisterPluginBuilder(quota.PluginName, quota.New)
 
 	// Plugins for Extender
 	framework.RegisterPluginBuilder(extender.PluginName, extender.New)

@@ -155,52 +155,6 @@ In reclaim when hierarchy is enabled, victims are processed by `BuildVictimsPrio
 
 This allows operators to tighten reclaim boundaries in larger queue trees while preserving default behavior when no restriction is required.
 
-### Enqueue admission on reclaimable ancestor capacity
-
-The enqueue gate (`jobEnqueueable`, checked for the leaf and every ancestor by
-`checkJobEnqueueableHierarchically`) models what can be freed with the `elastic` term only: a running job's
-usage above its own `minResources`. Reclaim decides victims by a different model: a leaf's usage above its
-`deserved`, filtered by the preemptable flag, `reclaimable`, the `guarantee` floor and gang. The two
-disagree when a parent carries a `capability`, the holders have no elastic usage (PodGroups whose
-`minResources` equal their usage, as the PodGroup controller creates them for bare pods), and an
-under-deserved sibling asks: the gate rejects the job at the parent, the PodGroup stays Pending, and the
-`reclaim` action skips Pending jobs. This is the enqueue-side form of
-[volcano-sh/volcano#4817](https://github.com/volcano-sh/volcano/issues/4817); the reclaim-side form is
-handled in the `reclaim` action's stop condition (`reclaimerFitsOnNode` includes `ssn.Allocatable`).
-
-With plugin argument `enqueueAncestorCapReclaim: true` (hierarchy mode only, default `false`), a job that
-fails the gate is admitted by `enqueueableViaAncestorReclaim` for a trial by the reclaim action when, on every
-requested dimension:
-
-1. the leaf passes its own check unchanged;
-2. the leaf stays at or under its `deserved` after admission, without elastic credit (a requested dimension
-   missing from `deserved` counts as zero);
-3. every failing ancestor fails on `realCapability` only (a DRA failure still rejects).
-
-The gate establishes entitlement and nothing more. The trial is the real reclaim run in the same session:
-`JobEnqueuedFn` tags the PodGroup with an `Inqueue` condition whose reason is `AncestorCapReclaim`, the
-reclaim action evaluates the job and records a verdict (`JobInfo.ReclaimResult`), and the dequeue action,
-running after reclaim, returns the job to `Pending` on `ReclaimFailed` (victims existed, no node could be made
-to fit, every tentative eviction rolled back) or on `ReclaimNoVictims` for a tagged job (the admission premise
-was false). A failed trial persists only the two conditions; the `inqueue` reservation lasts one session and
-the job is reconsidered after `enqueueBackoff`. The relaxed path is refused when the dequeue action is not
-enabled (`conf.EnabledActionMap`), since nothing would revert a job reclaim cannot serve.
-
-This replaces an earlier estimate of reclaimable slack in the gate. The estimate re-implemented the victim
-rules and could be wrong in the conservative direction: an over-deserved victim can carry a resource the
-queue is not over-deserved on (G9), which reclaim frees but an estimate keyed on deserved exceedance does not
-see. The trial cannot be wrong, because it is reclaim itself. The rule is strictly all-dimension on the asker
-side and never relaxes the leaf's own capability, in contrast to the approach in
-[volcano-sh/volcano#4825](https://github.com/volcano-sh/volcano/pull/4825), which admitted on any single
-dimension below `deserved` or `guarantee` and skipped the capability checks. `inqueue` accounting
-(`JobEnqueuedFn`) is unchanged.
-
-The table-driven test `Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation` (section G) covers the
-default rejection, admission with reclaim in the same session, the trials that dequeue reverts (non-preemptable
-holders, `reclaimable: false`, holders at `deserved`, victims that cannot free enough, victims spread over
-nodes), the entitlement rejection (a leaf over `deserved` on one dimension), the cpu+gpu case the estimate
-got wrong, and the refusal when the dequeue action is absent.
-
 #### Unit test scenarios and behavior map
 
 The table-driven test `Test_capacityPlugin_AncestorReclaimScenarios` covers case1-case11 with explicit topologies and reclaim outcomes.
@@ -392,38 +346,6 @@ graph TD
 - Expected: depth-2 ancestor gate fails; no eviction and no pipeline.
 
 **Note:** The above modifications are primarily applicable when `EnabledHierarchy` is set to true. If the capacity plugin does not require hierarchical queue management, the existing implementations of these functions will be retained.
-
-### Reserving the deserved share of admitted jobs
-
-Plugin argument `reserveDeserved` (default `false`). Without it, `deserved` is enforced only by reclaim:
-the allocatable check compares `allocated + request` with `realCapability` at the leaf and every
-ancestor, and an over-deserved queue can consume a parent's capability that an under-deserved sibling
-with an admitted job is waiting for. Right after a reclaim this lets the victim's replacement take the
-freed space ahead of the job the eviction served.
-
-With the argument on, every `queueAttr` carries a `reserve`, rebuilt per session and kept live by the
-allocate and deallocate event handlers (and the job-enqueued handler for jobs admitted in-session):
-
-```
-leaf:   reserve = clamp0(min(deserved, allocated + unplaced) - allocated)         per dimension
-        unplaced = Σ over Inqueue jobs with minResources of
-                   clamp0(minResources - resources of tasks in allocated status or Pipelined)
-                   (gated pods deducted as for the inqueue term)
-parent: reserve = min(Σ children.reserve, clamp0(deserved - allocated))           per dimension
-        (a dimension with no deserved on the parent passes the children's sum through)
-```
-
-`checkQueueAllocatableHierarchically` then charges each ancestor on the candidate's path with
-`clamp0(ancestor.reserve - pathChild.reserve)`:
-
-```
-allocated + queueGateReserved + request + reservedByOthers <= realCapability
-```
-
-on the candidate's dimensions. The leaf check is unchanged, and the candidate's own subtree keeps its
-owed share available to itself. The reservation is not a node reservation: two queues both within
-their `deserved` still compete for a freed node slot in queue order. The simulated allocatable check
-used by the gangpreempt and gangreclaim actions does not charge the reserve.
 
 ### Vcctl
 

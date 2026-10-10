@@ -15,7 +15,7 @@ tasks are scheduled, and no action releases the reservation. A PodGroup that can
 therefore stays `Inqueue` forever: its reservation starves its queue's siblings and the actions
 spend work on it every session. Known ways to reach that state include node affinity or node
 selectors that the enqueue gate cannot see, a victim that the gang plugin refuses to evict, the
-ancestor-capability admission of the capacity plugin when the reclaimable usage is spread over
+ancestor-capability admission of the quota plugin when the reclaimable usage is spread over
 nodes, and any change of cluster state between admission and service.
 
 The dequeue action returns such a PodGroup to `Pending`. It does not make a job servable; it
@@ -42,7 +42,7 @@ success, not a failure. A verdict is therefore only `ReclaimFailed` when the cur
 cannot serve the job, and the enqueue backoff covers the case where that state changes later.
 
 `ReclaimNoVictims` is ordinary waiting for capacity and leaves the job `Inqueue`, with one
-exception: a PodGroup the capacity plugin admitted past an ancestor's capability on entitlement
+exception: a PodGroup the quota plugin admitted past an ancestor's capability on entitlement
 (`enqueueAncestorCapReclaim`) carries an `Inqueue` condition with reason `AncestorCapReclaim`. Its admission depended on reclaim, so `ReclaimNoVictims` means the premise is
 false and the job is dequeued as well.
 
@@ -91,10 +91,10 @@ With the defaults the action is driven purely by reclaim's verdict.
 
 - The unschedulable-job cache (`job.Skip.Enqueue`) is independent: it suppresses enqueue attempts
   based on rejection hints, while the backoff here is time based. Both are honored.
-- The capacity plugin's `enqueueAncestorCapReclaim` admission is a trial that relies on this
+- The quota plugin's `enqueueAncestorCapReclaim` admission is a trial that relies on this
   action: it admits on entitlement alone, reclaim tries in the same session, and this action
   reverts the admission on a failed verdict. The plugin refuses the relaxed admission when this
-  action is not enabled. See the capacity plugin user guide.
+  action is not enabled. See the quota plugin user guide.
 - The gang plugin's `Unschedulable` condition is unaffected; the `Inqueue` and `Dequeued` conditions
   are additional entries in the same list. The verdict is derived from what reclaim did, not from
   the session's job-pipelined query, which defaults to permit when no plugin implements it.
@@ -110,7 +110,7 @@ evicted; G15 shows the opt-in timeout doing the same for a job reclaim never eva
 
 ## Known gaps and follow-ups
 
-Where the admission-trial design (capacity `enqueueAncestorCapReclaim` + reclaim verdict + dequeue)
+Where the admission-trial design (the quota plugin's `enqueueAncestorCapReclaim` + reclaim verdict + dequeue)
 can still leave a job in the wrong state, with the intended follow-up for each. None of these is
 implemented yet.
 
@@ -124,7 +124,7 @@ implemented yet.
   annotation, the pods are created gated, autoscalers never see them, and the reclaim action now
   treats a pod gated only by Volcano's queue-allocation gate as an asker (`queueGatedAsker`), so the
   trial runs on the real gated pods and allocate removes the gate once the queue check passes.
-  See the capacity plugin user guide, "Volcano Jobs".
+  See the quota plugin user guide, "Volcano Jobs".
 - If the pods never appear, or are gated by something other than Volcano's gate, reclaim skips the
   job every session and no verdict is ever produced. Only the opt-in `inqueueTimeout` covers this.
   Follow-up: treat a tagged group with `ReclaimNotAttempted` for N consecutive sessions as a failed
@@ -158,7 +158,7 @@ implemented yet.
 
 - Pipelining is not persisted across sessions and Volcano has no node reservation. After a
   successful trial the victims drain; if another pod takes the freed space first, the next session
-  finds no victims left and dequeues the asker. The evictions were spent for nothing. The capacity
+  finds no victims left and dequeues the asker. The evictions were spent for nothing. The quota
   plugin's `reserveDeserved` argument closes the common case: while the asker is owed its deserved
   share, every ancestor refuses candidates from other subtrees (the victim's replacement above
   all) that would consume it. What remains is the node-level race between two queues both within
