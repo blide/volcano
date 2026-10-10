@@ -204,31 +204,88 @@ implemented yet.
 
 ### Victim choice across nodes: cost, not exemption
 
-- Reclaim is first-fit per node: it walks the candidate nodes in list order and commits on the
-  first node where the asker fits after evicting that node's admissible victims, sorted lowest
-  priority first. Priority therefore orders victims only within a node. A pod that is the only
-  reclaimable pod on an early node is evicted even when cheaper victims exist on the next node,
-  which is how a Spark driver gets reclaimed although its executors were available.
-- The hard filter (`volcano.sh/preemptable: "false"`) is the only protection today, and it is
+- Reclaim was first-fit per node: it walked the candidate nodes in list order and committed on the
+  first node where the asker fit after evicting that node's admissible victims, sorted lowest
+  priority first. Priority therefore ordered victims only within a node. A pod that was the only
+  reclaimable pod on an early node was evicted even when cheaper victims existed on the next node,
+  which is how a Spark driver got reclaimed although its executors were available.
+- The hard filter (`volcano.sh/preemptable: "false"`) was the only protection, and it is
   user-settable: a tenant that labels everything never returns borrowed capacity, and no queue
   setting overrides it. Guarantees of other queues become unenforceable.
-- Follow-up, designed but not implemented: evaluate every candidate node, keep each per-node
-  statement open, score the victim sets and commit the cheapest, modeled on YuniKorn's solution
-  score and kube-scheduler's preemption rule: the priority of the highest-priority victim first,
-  then the victim count; a node that fits without eviction scores zero. Priority then is a cost:
-  a high-priority driver is taken only when no cheaper node exists, and abusing a PriorityClass
-  buys "evicted last", never "never evicted". PriorityClasses are cluster-scoped and can be capped
-  per namespace with a ResourceQuota scope. The label stays a filter for the few pods that truly
-  need it and should not be grantable to users. The hierarchy round above would run on the chosen
-  node.
+- Implemented behind the reclaim action argument `victimSelection: bestFit` (see
+  [reclaim-action.md](reclaim-action.md), "Victim selection"): every candidate node is planned and
+  rolled back, the victim sets are scored with the keys of the per-node victim order (victim
+  queue first, then highest victim priority, then victim count, then node name) and the cheapest
+  plan is replayed and committed; a node that fits without eviction wins outright. Modeled on YuniKorn's solution score and kube-scheduler's preemption rule.
+  Priority then is a cost: a high-priority driver is taken only when no cheaper node exists, and
+  abusing a PriorityClass buys "evicted last", never "never evicted". PriorityClasses are
+  cluster-scoped and can be capped per namespace with a ResourceQuota scope, and because the
+  victim queue is compared before the class value, a tenant that over-labels only reorders its
+  own evictions (victim selection tests F1, F2). The label stays a filter for the few pods that truly need it
+  and should not be grantable to users. The reclaimee order handed to the plugins is now cheapest
+  first in both modes, so gang's arrival-order veto lands on the driver rather than the executor.
+- Still parked: the cost is per node. The cross-node round above would run on the chosen node, and
+  nothing holds the freed room for the asker across sessions.
 
-### Reclaim retry throttle
+### Re-eviction while victims terminate
 
-- A pipelined asker whose nominated node still carries terminating victims is Pending again next
-  session; if it does not fit yet, reclaim evicts again. Preempt already waits in that case
-  (`taskEligibleToPreempt`). Follow-up: skip an asker in reclaim while its nominated node has a
-  terminating pod evicted by the scheduler, counted as not attempted so the dequeue action leaves
-  it alone. A few lines; removes most double evictions before any node hold is considered.
+- A pipelined asker is Pending again next session; what stops reclaim from evicting again for it,
+  every second for the whole termination grace period, is the allocate action. The cache writes
+  the node reclaim pipelined the asker on into the pod's nominated node; allocate tries that node
+  first and pipelines the asker onto its future idle, the room the terminating victims free. The
+  job is then not starving and reclaim does not run for it. The pipelined asker takes that room in
+  the session's accounting, so other askers plan elsewhere.
+- This holds only with `allocate` before `reclaim`, the documented order. With reclaim first, a
+  node whose terminating pods were its only reclaimable ones yields no plan at all, the asker is
+  planned afresh and evicts on another node, again in every session until the victims are gone.
+  `bestFit` covers the nodes that still carry a Running victim (their zero-victim plan wins) and
+  nothing covers the others. Keep allocate ahead of reclaim.
+- Preempt guards the same window on its own (`taskEligibleToPreempt` skips a preemptor whose
+  nominated node still has a pod the scheduler evicted); reclaim needs no equivalent while
+  allocate runs first.
+
+### The freed room goes to the first ask in order
+
+- The nomination makes allocate try that node first for that ask; it does not reserve the room
+  against an ask that sorts earlier. Allocate walks queue, job and task order, and any pending task
+  that fits the node's future idle is pipelined onto the terminating victims' room when its turn
+  comes. The ask that paid for the eviction then no longer fits its nominated node, falls through
+  to the regular node search, finds nothing and reclaims a second time. The eviction count across
+  the cluster still matches the asks served, but the originator's eviction was spent on someone
+  else, and that someone can be a task its queue should not be growing at all: the capacity queue
+  order compares the tenants' shares where two leaves diverge, and a tenant in failover looks the
+  most over-deserved of all because its draining active pods still count as allocated, so another
+  tenant's over-deserved replacement sorts first (victim selection test R4).
+- YuniKorn makes this a reservation: after preemption the node is reserved for the originating
+  ask, and reserved asks are tried before any regular allocation in the cycle. Volcano has the
+  same shape only for the gang actions: a job with a `NominatedHyperNode` is allocated in a
+  nominated phase ahead of every regular job. The legacy reclaim's pod-level nomination gets no
+  such phase.
+- Implemented: a reserved-ask pass at the start of the allocate action, before the
+  nominated-hypernode and regular phases, modeled on YuniKorn's `tryReservedAllocate`.
+  - Candidates are the pending tasks whose nomination is live: the nominated node exists in the
+    session, still carries a pod the scheduler evicted that is terminating (DisruptionTarget
+    condition, reason "preemption by scheduler", as the evictor writes it), and the task fits the
+    node's future idle, is allocatable in its queue hierarchy and passes the predicates. The
+    nomination is written only when a pipeline followed an eviction, so only asks that paid for
+    room qualify; an ask pipelined onto someone else's room never does.
+  - The pass visits those tasks in the usual queue, job and task order, re-checks the nomination
+    at service time (an earlier reserved ask may have taken the node's room), and places each on
+    its nominated node: bound when the node already has idle room, pipelined otherwise. The
+    commit rule is the regular phase's: a ready job is committed, a pipelined job's statement
+    stays applied in the session, anything else is rolled back. A placed task leaves its job's
+    worksheet; a task whose nomination is stale is left to the regular phases and then reclaim.
+  - Effects: the originator holds its room in the session's accounting before any regular ask is
+    considered (victim selection tests R2, R4, R5). In R4 the other tenant's replacement finds no room and,
+    being over its deserved, cannot reclaim; nothing is evicted. The reserve of `reserveDeserved`
+    protects the quota for the admitted job; this pass protects the node slot for the ask. They
+    compose.
+  - Limits: the hold is for the session only; nothing is persisted beyond the nomination, and a
+    node that disappears or a victim that finishes early ends it, which is right. It is per ask,
+    not per job: other pending tasks of the same job wait their regular turn. Jobs with hard
+    network topology or sub-job policies go through their own path and are not reserved. Gang
+    jobs with `minAvailable` above one are committed only when the job's readiness rule allows,
+    as in the regular phase.
 
 ### External gangs: Spark
 
