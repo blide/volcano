@@ -49,19 +49,15 @@ node succeeds, and a discarded statement restores every victim, local or remote.
 
 `Allocatable` is boolean. Evicting a victim outside the blocking ancestor's subtree lowers
 `allocated` somewhere else and changes nothing for the ask, so the quota round must know which
-ancestor blocks. One query is added to the capacity plugin and the session:
+ancestor blocks. The [quota plugin](quota-plugin.md) answers this through the existing allocatable
+hook: called with an ancestor of the task's own queue, it runs the capability check restricted to
+that queue and above, with the path and its reserve charges still taken from the task's job. The
+round walks the task's queue ancestry from the leaf to the root calling `ssn.Allocatable` with each
+queue; the deepest queue that fails is the blocker. No new extension point, and no framework
+change. (The alternative, a dedicated `BlockingQueuesFn` returning the failing ancestors deepest
+first, costs one aggregator in the session and is the cleaner API if the maintainers prefer it.)
 
-```
-BlockingQueuesFn(queue *api.QueueInfo, task *api.TaskInfo) []api.QueueID
-```
-
-It returns the queues on the path from the task's queue to the root whose capability check fails
-for the task, deepest first, computed by the same loop as `checkQueueAllocatableHierarchically`
-without its early return, reserve charges included. The capacity plugin registers it; the session
-exposes `ssn.BlockingQueues`. A plugin that does not implement it returns nothing, and the quota
-round then evicts nothing: a hierarchy the action cannot see is not one it should guess at.
-
-The round re-reads the blockers after every eviction. The deepest blocker decides the candidate
+The round re-reads the blocker after every eviction. The deepest blocker decides the candidate
 set, because a victim under it relieves every blocker above it as well; when the deepest blocker
 clears and a shallower one remains, the candidate set widens to that ancestor's subtree.
 
@@ -151,14 +147,13 @@ configurations:
       maxCrossNodeVictims: 0       # 0 = unbounded
 ```
 
-Requires the capacity plugin with hierarchy enabled for ancestor blockers; with flat queues the
-leaf is the only blocker and the round still applies.
+Requires the quota plugin for the ancestor form of the allocatable check; with flat queues the leaf
+is the only blocker and the round still applies.
 
 ## Implementation plan
 
-1. Capacity plugin: `blockingQueues(queue, task)` next to `checkQueueAllocatableHierarchically`,
-   sharing the per-ancestor check; registered through a new `AddBlockingQueuesFn`. Session:
-   `BlockingQueues` running the first registered implementation in tier order.
+1. Quota plugin: the ancestor form of its allocatable check (see quota-plugin.md), sharing the
+   per-ancestor loop with the leaf form.
 2. Reclaim action: argument parsing; `reclaimerFitsOnNode` loses the queue term when the round is
    on; `quotaRound(ssn, plan, queue, task, candidates)` evicting into the plan's statement;
    `crossNodeReclaimees` building the candidate list once per ask; integration in `planOnNode`

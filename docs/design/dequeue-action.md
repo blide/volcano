@@ -185,8 +185,8 @@ implemented yet.
   job instead of leaving it stuck, but does not serve it. The fix is designed in
   [quota-aware-reclaim.md](quota-aware-reclaim.md): a quota round after the node round, behind the
   reclaim action argument `crossNodeVictims`, that evicts the cheapest admissible victims under the
-  blocking ancestor from any node until the hierarchy admits the ask, with a `BlockingQueues` query
-  into the capacity plugin so the round knows what it is relieving. Not implemented yet.
+  blocking ancestor from any node until the hierarchy admits the ask, asking the
+  [quota plugin](quota-plugin.md) which ancestor it is relieving. Not implemented yet.
 
 ### Victim choice across nodes: cost, not exemption
 
