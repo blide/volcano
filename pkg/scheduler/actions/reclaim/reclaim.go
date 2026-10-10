@@ -23,6 +23,8 @@ limitations under the License.
 package reclaim
 
 import (
+	"math"
+
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
@@ -33,13 +35,33 @@ import (
 	"volcano.sh/volcano/pkg/scheduler/util"
 )
 
+const (
+	// VictimSelectionKey is the reclaim action argument choosing how the node to reclaim on is
+	// picked for an asker: firstFit (default) or bestFit.
+	VictimSelectionKey = "victimSelection"
+	// VictimSelectionFirstFit commits on the first candidate node where the asker fits after
+	// evicting that node's victims. Candidate order is not stable, so which node that is, and
+	// how expensive its victims are, is incidental.
+	VictimSelectionFirstFit = "firstFit"
+	// VictimSelectionBestFit explores every candidate node and commits the cheapest victim set:
+	// lowest highest-victim-priority first, then fewest victims. Priority is thereby a cost rather
+	// than an exemption: an expensive pod is taken only when no node can be served without it.
+	VictimSelectionBestFit = "bestFit"
+	// MaxCandidateNodesKey bounds how many nodes with a viable plan bestFit explores for one
+	// asker before committing; 0 (default) means all candidate nodes.
+	MaxCandidateNodesKey = "maxCandidateNodes"
+)
+
 type Action struct {
 	enablePredicateErrorCache bool
+	victimSelection           string
+	maxCandidateNodes         int
 }
 
 func New() *Action {
 	return &Action{
 		enablePredicateErrorCache: true,
+		victimSelection:           VictimSelectionFirstFit,
 	}
 }
 
@@ -52,6 +74,22 @@ func (ra *Action) Initialize() {}
 func (ra *Action) parseArguments(ssn *framework.Session) {
 	arguments := framework.GetArgOfActionFromConf(ssn.Configurations, ra.Name())
 	arguments.GetBool(&ra.enablePredicateErrorCache, conf.EnablePredicateErrCacheKey)
+
+	ra.victimSelection = VictimSelectionFirstFit
+	var selection string
+	arguments.GetString(&selection, VictimSelectionKey)
+	switch selection {
+	case "", VictimSelectionFirstFit:
+	case VictimSelectionBestFit:
+		ra.victimSelection = VictimSelectionBestFit
+	default:
+		klog.Warningf("[reclaim] unknown %s %q; using %s", VictimSelectionKey, selection, VictimSelectionFirstFit)
+	}
+	ra.maxCandidateNodes = 0
+	arguments.GetInt(&ra.maxCandidateNodes, MaxCandidateNodesKey)
+	if ra.maxCandidateNodes < 0 {
+		ra.maxCandidateNodes = 0
+	}
 }
 
 func (ra *Action) Execute(ssn *framework.Session) {
@@ -177,6 +215,9 @@ func (ra *Action) Execute(ssn *framework.Session) {
 	}
 }
 
+// reclaimForTask tries to place task by evicting on one node. With firstFit the first node with a
+// viable plan is committed. With bestFit every candidate node is planned and rolled back, the
+// cheapest plan is replayed and committed.
 func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, job *api.JobInfo) {
 	totalNodes := ssn.FilterOutUnschedulableAndUnresolvableNodesForTask(task)
 	predicateHelper := util.NewPredicateHelper()
@@ -186,63 +227,144 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 	for _, nodes := range predicateNodesByShard {
 		predicateNodesByShardFlattened = append(predicateNodesByShardFlattened, nodes...)
 	}
+
+	var best *nodePlan
+	planned := 0
 	for _, n := range predicateNodesByShardFlattened {
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.", task.Namespace, task.Name, n.Name)
 
-		reclaimees := reclaimeesOnNode(ssn, job, task, n)
-		if len(reclaimees) == 0 {
-			klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
+		plan := planOnNode(ssn, task, job, n)
+		if plan == nil {
 			continue
 		}
-
-		victims := ssn.Reclaimable(task, reclaimees)
-		if err := util.ValidateVictims(task, n, victims); err != nil {
-			klog.V(3).Infof("No validated victims on Node <%s>: %v", n.Name, err)
-			continue
+		if ra.victimSelection != VictimSelectionBestFit {
+			stmt.Merge(plan.stmt)
+			return
 		}
 
-		victimsQueue := ssn.BuildVictimsPriorityQueue(victims, task)
-		resreq := task.InitResreq.Clone()
-		reclaimed := api.EmptyResource()
-
-		availableResources := n.FutureIdle()
-		reclaimerFits := reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
-
-		// Use a per-node statement so that evictions are isolated to this node.
-		// Only merge into the caller's stmt if Pipeline succeeds; otherwise discard
-		// so victims on nodes that end up unused are never committed to Kubernetes.
-		nodeStmt := framework.NewStatement(ssn)
-		evictionOccurred := false
-		for !victimsQueue.Empty() {
-			if reclaimerFits {
-				break
-			}
-			reclaimee := victimsQueue.Pop().(*api.TaskInfo)
-			klog.V(3).Infof("Try to reclaim Task <%s/%s> for Tasks <%s/%s>",
-				reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name)
-			nodeStmt.Evict(reclaimee, "reclaim")
-			reclaimed.Add(reclaimee.Resreq)
-			availableResources.Add(reclaimee.Resreq)
-			evictionOccurred = true
-			reclaimerFits = reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
+		// bestFit: roll the exploration back and keep the plan; the winner is replayed below.
+		plan.stmt.Discard()
+		plan.stmt = nil
+		if plan.cheaperThan(best) {
+			best = plan
 		}
-
-		klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
-
-		if !reclaimerFits {
-			nodeStmt.Discard()
-			continue
+		planned++
+		if len(best.victims) == 0 || (ra.maxCandidateNodes > 0 && planned >= ra.maxCandidateNodes) {
+			break
 		}
-
-		if err := nodeStmt.Pipeline(task, n.Name, evictionOccurred); err != nil {
-			klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>",
-				task.Namespace, task.Name, n.Name)
-			nodeStmt.Discard()
-			continue
-		}
-		stmt.Merge(nodeStmt)
-		break
 	}
+	if best != nil {
+		replayPlan(ssn, stmt, task, best)
+	}
+}
+
+// nodePlan is one viable way to serve the asker: the node, the victims evicted on it in order, and,
+// while the exploration is still open, the per-node statement holding those tentative evictions
+// and the pipeline.
+type nodePlan struct {
+	node             *api.NodeInfo
+	victims          []*api.TaskInfo
+	evictionOccurred bool
+	stmt             *framework.Statement
+}
+
+// maxPriority is the highest pod priority among the plan's victims; a plan without victims ranks
+// below any priority.
+func (p *nodePlan) maxPriority() int32 {
+	m := int32(math.MinInt32)
+	for _, v := range p.victims {
+		if v.Priority > m {
+			m = v.Priority
+		}
+	}
+	return m
+}
+
+// cheaperThan orders plans: lowest highest-victim priority, then fewest victims, then node name so
+// the choice does not depend on the candidate order, which is not stable.
+func (p *nodePlan) cheaperThan(o *nodePlan) bool {
+	if o == nil {
+		return true
+	}
+	if a, b := p.maxPriority(), o.maxPriority(); a != b {
+		return a < b
+	}
+	if len(p.victims) != len(o.victims) {
+		return len(p.victims) < len(o.victims)
+	}
+	return p.node.Name < o.node.Name
+}
+
+// planOnNode explores serving the task on node: it evicts that node's admissible victims, cheapest
+// first, into a per-node statement until the task fits, then pipelines the task there. It returns
+// the open plan, or nil after rolling the statement back when the node cannot serve the task.
+func planOnNode(ssn *framework.Session, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) *nodePlan {
+	reclaimees := reclaimeesOnNode(ssn, job, task, n)
+	if len(reclaimees) == 0 {
+		klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
+		return nil
+	}
+
+	victims := ssn.Reclaimable(task, reclaimees)
+	if err := util.ValidateVictims(task, n, victims); err != nil {
+		klog.V(3).Infof("No validated victims on Node <%s>: %v", n.Name, err)
+		return nil
+	}
+
+	victimsQueue := ssn.BuildVictimsPriorityQueue(victims, task)
+	resreq := task.InitResreq.Clone()
+	reclaimed := api.EmptyResource()
+
+	availableResources := n.FutureIdle()
+	reclaimerFits := reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
+
+	// Use a per-node statement so that evictions are isolated to this node. Only a plan whose
+	// Pipeline succeeds is ever merged into the caller's statement; everything else is discarded
+	// so victims on nodes that end up unused are never committed to Kubernetes.
+	plan := &nodePlan{node: n, stmt: framework.NewStatement(ssn)}
+	for !victimsQueue.Empty() && !reclaimerFits {
+		reclaimee := victimsQueue.Pop().(*api.TaskInfo)
+		klog.V(3).Infof("Try to reclaim Task <%s/%s> for Tasks <%s/%s>",
+			reclaimee.Namespace, reclaimee.Name, task.Namespace, task.Name)
+		plan.stmt.Evict(reclaimee, "reclaim")
+		plan.victims = append(plan.victims, reclaimee)
+		plan.evictionOccurred = true
+		reclaimed.Add(reclaimee.Resreq)
+		availableResources.Add(reclaimee.Resreq)
+		reclaimerFits = reclaimerFitsOnNode(ssn, task, n, resreq, availableResources)
+	}
+
+	klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
+
+	if !reclaimerFits {
+		plan.stmt.Discard()
+		return nil
+	}
+	if err := plan.stmt.Pipeline(task, n.Name, plan.evictionOccurred); err != nil {
+		klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>: %v", task.Namespace, task.Name, n.Name, err)
+		plan.stmt.Discard()
+		return nil
+	}
+	return plan
+}
+
+// replayPlan re-applies a plan whose exploration was rolled back and merges it into stmt. Nothing
+// runs between the exploration and the replay within a session, so the victims are still Running
+// and the node is as it was; a failure here is a state bug, not a scheduling outcome.
+func replayPlan(ssn *framework.Session, stmt *framework.Statement, task *api.TaskInfo, plan *nodePlan) {
+	nodeStmt := framework.NewStatement(ssn)
+	for _, victim := range plan.victims {
+		nodeStmt.Evict(victim, "reclaim")
+	}
+	if err := nodeStmt.Pipeline(task, plan.node.Name, plan.evictionOccurred); err != nil {
+		klog.Errorf("Failed to replay the best-fit reclaim plan for Task <%s/%s> on Node <%s>: %v",
+			task.Namespace, task.Name, plan.node.Name, err)
+		nodeStmt.Discard()
+		return
+	}
+	klog.V(3).Infof("Best-fit reclaim for Task <%s/%s>: Node <%s>, %d victims, highest victim priority %d",
+		task.Namespace, task.Name, plan.node.Name, len(plan.victims), plan.maxPriority())
+	stmt.Merge(nodeStmt)
 }
 
 // reclaimeesOnNode lists the Running, preemptable tasks on node that belong to another, reclaimable

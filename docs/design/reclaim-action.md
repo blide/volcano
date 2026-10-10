@@ -60,3 +60,61 @@ total number of tasks running for a job is going to be less than the minAvailabl
 #### Proportion:
 It checks whether by evicting a task, that task's queue has allocated resource less than the deserved share.  If so, that task
 is added as a victim task that can be evicted so that resource can be reclaimed.
+
+## Victim selection
+
+Reclaim evicts on one node per asker. The node loop asks the plugins for the admissible victims
+among the node's Running, preemptable tasks of other reclaimable queues, evicts them into a per-node
+statement until the asker fits the node and its queue hierarchy, and pipelines the asker there. Two
+decisions shape which pods get evicted: the order the victims are tried in on a node, and which node
+is committed.
+
+### Order within a node
+
+Victims on a node are tried through `BuildVictimsPriorityQueue`: victim queue order, then job order,
+then the lowest task priority first. The reclaim action hands the reclaimees to the plugins in that
+same order. This matters for plugins whose veto depends on arrival order: gang's `ReclaimableFn`
+admits victims until the job would drop below `minAvailable`, so on a node holding a job's driver
+and one of its executors it admits whichever arrives first. Cheapest first means the executor is
+admitted and the driver vetoed, never the reverse.
+
+### Which node: `victimSelection`
+
+The action argument `victimSelection` picks the node:
+
+- `firstFit` (default): the first candidate node whose per-node plan succeeds is committed. The
+  candidate list comes from the predicate helper, which fills it in parallel, so the order is not
+  stable: which node is first, and how expensive its victims are, is incidental. A pod that is the
+  only reclaimable pod on an early node is evicted although cheaper victims exist on the next node,
+  which is how a Spark driver gets reclaimed while its executors were available.
+- `bestFit`: every candidate node is planned the same way, each plan is rolled back, and the cheapest
+  one is replayed and committed. A plan's cost is the highest pod priority among its victims, then
+  the number of victims, then the node name so the result does not depend on the candidate order. A
+  node that fits without eviction costs less than any eviction and ends the search. The argument
+  `maxCandidateNodes` bounds how many nodes with a viable plan are explored before committing;
+  `0` (default) explores all candidates.
+
+The rollback-and-replay shape keeps the per-node isolation introduced for first-fit: evictions on
+nodes that end up unused are never committed, and the replay runs in the same session with nothing
+in between, so the recorded victims are still Running when they are evicted for real.
+
+Priority is thereby a cost rather than an exemption. A high-priority driver is taken only when no
+node can be served by lower-priority victims, and abusing a PriorityClass buys "evicted last", never
+"never evicted". The hard filter `volcano.sh/preemptable: "false"` remains for the few pods that
+truly must not move; because it is user-settable and no queue setting overrides it, a tenant that
+labels everything never returns borrowed capacity, so it should not be grantable to users.
+PriorityClasses are cluster-scoped and can be capped per namespace with a ResourceQuota scope.
+
+Out of scope for this selection: the cost is per node, so it does not combine victims from several
+nodes to free a queue's quota, and nothing holds the freed room for the asker after the session.
+
+Configuration:
+
+```yaml
+actions: "enqueue, allocate, backfill, reclaim"
+configurations:
+  - name: reclaim
+    arguments:
+      victimSelection: bestFit   # firstFit (default) or bestFit
+      maxCandidateNodes: 0       # bestFit only; 0 explores every candidate node
+```

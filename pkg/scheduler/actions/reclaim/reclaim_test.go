@@ -476,3 +476,30 @@ func TestReclaimRechecksPredicateAfterEviction(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestParseVictimSelection(t *testing.T) {
+	cases := []struct {
+		name          string
+		args          map[string]interface{}
+		wantSelection string
+		wantMax       int
+	}{
+		{name: "defaults", args: nil, wantSelection: VictimSelectionFirstFit, wantMax: 0},
+		{name: "bestFit", args: map[string]interface{}{VictimSelectionKey: VictimSelectionBestFit, MaxCandidateNodesKey: 3}, wantSelection: VictimSelectionBestFit, wantMax: 3},
+		{name: "unknown selection falls back", args: map[string]interface{}{VictimSelectionKey: "cheapest"}, wantSelection: VictimSelectionFirstFit, wantMax: 0},
+		{name: "negative bound means unbounded", args: map[string]interface{}{VictimSelectionKey: VictimSelectionBestFit, MaxCandidateNodesKey: -1}, wantSelection: VictimSelectionBestFit, wantMax: 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ssn := &framework.Session{}
+			if c.args != nil {
+				ssn.Configurations = []conf.Configuration{{Name: "reclaim", Arguments: c.args}}
+			}
+			ra := New()
+			ra.parseArguments(ssn)
+			if ra.victimSelection != c.wantSelection || ra.maxCandidateNodes != c.wantMax {
+				t.Fatalf("want (%s, %d), got (%s, %d)", c.wantSelection, c.wantMax, ra.victimSelection, ra.maxCandidateNodes)
+			}
+		})
+	}
+}

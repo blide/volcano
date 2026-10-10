@@ -91,6 +91,71 @@ data:
       - name: binpack
 ```
 
+## Choose the cheapest victims across nodes
+
+The `reclaim` action evicts on one node per task. By default it commits on the first candidate node
+where the task fits after evicting that node's victims, and the candidate order is not stable, so
+which pods get evicted depends on which node happens to come first. With several pods of the same
+job spread over nodes, for example a Spark driver on one node and its executors on others, the
+driver can be evicted while an executor would have freed the same amount.
+
+Setting the reclaim action argument `victimSelection: bestFit` makes reclaim plan every candidate
+node and commit the one whose victims cost least: the lowest highest-victim priority first, then the
+fewest victims; a node that fits without eviction wins outright. Priority thereby becomes a cost that
+reclaim pays as late as possible, instead of the `volcano.sh/preemptable: "false"` label, which
+exempts a pod altogether and lets a tenant that labels everything keep borrowed capacity for good.
+
+```yaml
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: volcano-scheduler-configmap
+  namespace: volcano-system
+data:
+  volcano-scheduler.conf: |
+    actions: "enqueue, allocate, backfill, reclaim"
+    tiers:
+    - plugins:
+      - name: priority
+      - name: gang
+      - name: conformance
+    - plugins:
+      - name: drf
+      - name: predicates
+      - name: capacity
+      - name: nodeorder
+      - name: binpack
+    configurations:
+    - name: reclaim
+      arguments:
+        victimSelection: bestFit   # firstFit (default) or bestFit
+        maxCandidateNodes: 0       # bestFit only: stop after this many nodes with a plan; 0 = all
+```
+
+Pair it with a PriorityClass ladder so the cost reflects what you want kept: drivers above
+executors, long-lived services above batch. PriorityClasses are cluster-scoped; cap which ones a
+namespace may use with a `ResourceQuota` using the `PriorityClass` scope, and keep the
+`volcano.sh/preemptable: "false"` label for the few workloads that truly must not move. Leave
+`preemptionPolicy` at its default: a pod whose class says `Never` is skipped by the `reclaim` action
+as an asker.
+
+```yaml
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: spark-driver
+value: 1000
+---
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: spark-executor
+value: 100
+```
+
+`bestFit` chooses between nodes, not across them: it never combines victims from several nodes to
+free a queue's quota, and it does not hold the freed room for the task beyond the current session.
+
 ## Config queue's deserved resources
 
 Assume there are two nodes and two queues named queue1 and queue2 in your kubernetes cluster, and each node has 4 CPU and 16Gi memory, then there will be total 8 CPU and 32Gi memory in your cluster.

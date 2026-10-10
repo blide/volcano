@@ -53,6 +53,10 @@ type vsCase struct {
 	priority bool
 	// gangReclaim enables gang's ReclaimableFn (the minAvailable veto).
 	gangReclaim bool
+	// bestFit sets the reclaim action's victimSelection to bestFit; maxCandidateNodes is passed
+	// along when non-zero.
+	bestFit           bool
+	maxCandidateNodes int
 	// actions overrides the action sequence; the default is enqueue, reclaim, allocate.
 	actions []framework.Action
 	// check runs extra assertions on the session after CheckAll.
@@ -215,12 +219,85 @@ func Test_capacityPlugin_ReclaimVictimSelection(t *testing.T) {
 				ExpectEvicted:   []string{"ns1/exec-a"},
 			},
 		},
+		// ------------------------------------------------------- bestFit across nodes
+		{
+			// Requirement. Across nodes, bestFit picks the node whose victims cost least: the
+			// driver filling n1 and an executor filling n2 both free the 2c the ask needs; the
+			// executor's node wins. First-fit would take whichever node came first.
+			priority: true,
+			bestFit:  true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "B1: bestFit evicts the executor on another node rather than the driver on the first node",
+				Pods: []*corev1.Pod{
+					vsRunning("driver-a", "pg-active", "n1", "2", true, &prioHigh),
+					vsRunning("exec-a", "pg-active", "n2", "2", true, &prioLow),
+					vsPending("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "2"), vsNode("n2", "2")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          defaultTree,
+				PriClass:        priClasses,
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n2"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-a"},
+			},
+		},
+		{
+			// Requirement. A node that serves the ask without any eviction beats every other
+			// plan. Active is 1c over its deserved, so capacity admits its executors as victims on
+			// both nodes; the tenant still has room for the ask. n1 (3c) has 1c idle and would need
+			// its 2c executor evicted, n2 has 3c idle and serves the ask as it is. Only reclaim runs,
+			// so the choice is reclaim's alone. First-fit evicts on n1 whenever n1 comes first.
+			bestFit: true,
+			actions: []framework.Action{enqueue.New(), reclaim.New()},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "B2: bestFit prefers the node that needs no eviction",
+				Pods: []*corev1.Pod{
+					vsRunning("exec-a1", "pg-active", "n1", "2", true, nil),
+					vsRunning("exec-a2", "pg-active", "n2", "1", true, nil),
+					vsPending("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "3"), vsNode("n2", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          vsTree("6", "6", "2", "6", "2", "6"),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n2"}},
+				ExpectEvictNum:  0,
+			},
+		},
+		{
+			// Requirement. At equal priority the plan with fewer victims wins: n1 must lose both
+			// of its 1c executors to free 2c, n2 one 2c executor.
+			bestFit: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "B3: bestFit prefers fewer victims at equal priority",
+				Pods: []*corev1.Pod{
+					vsRunning("exec-a1", "pg-active", "n1", "1", true, nil),
+					vsRunning("exec-a2", "pg-active", "n1", "1", true, nil),
+					vsRunning("exec-b", "pg-active", "n2", "2", true, nil),
+					vsPending("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "2"), vsNode("n2", "2")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          defaultTree,
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n2"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-b"},
+			},
+		},
 	}
 
 	for i, c := range cases {
 		t.Run(c.Name, func(t *testing.T) {
 			c.Plugins = plugins
-			ssn := c.RegisterSession(c.tiers(), nil)
+			var config []conf.Configuration
+			if c.bestFit {
+				args := map[string]interface{}{reclaim.VictimSelectionKey: reclaim.VictimSelectionBestFit}
+				if c.maxCandidateNodes > 0 {
+					args[reclaim.MaxCandidateNodesKey] = c.maxCandidateNodes
+				}
+				config = []conf.Configuration{{Name: reclaim.New().Name(), Arguments: args}}
+			}
+			ssn := c.RegisterSession(c.tiers(), config)
 			defer c.Close()
 			actions := defaultActions
 			if c.actions != nil {
