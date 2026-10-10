@@ -22,6 +22,7 @@ import (
 	"slices"
 	"time"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/klog/v2"
@@ -154,7 +155,142 @@ func (alloc *Action) Execute(ssn *framework.Session) {
 	klog.V(3).Infof("Try to allocate resource: %d Queues with nominated jobs, %d Queues with regular jobs",
 		actx.queuesNominated.Len(), actx.queuesRegular.Len())
 
+	alloc.allocateReservedAsks(actx)
 	alloc.allocateResources(actx)
+}
+
+// reservedAsk is a pending task whose previous reclaim or preempt is still in flight: the node it
+// was pipelined on after an eviction is in its pod's nominatedNodeName and the victims evicted
+// there are still terminating.
+type reservedAsk struct {
+	queue *api.QueueInfo
+	job   *api.JobInfo
+	tasks *util.PriorityQueue
+	task  *api.TaskInfo
+}
+
+// allocateReservedAsks serves the asks that paid for their room before any regular ask is
+// considered, the way YuniKorn tries reserved allocations ahead of the regular ones. The cache
+// writes the nominated node only when a pipeline followed an eviction, so only such asks qualify.
+// Each is placed on its nominated node, which pipelines it onto the room its terminating victims
+// free (or binds it when the node already has idle room), so that room counts as taken for the
+// rest of the session and no earlier-sorting ask takes it: without this pass the originator finds
+// its room gone, falls through to the regular node search and reclaims a second time. Candidates
+// are visited in the usual queue, job and task order; an ask whose nomination is stale (victims
+// gone, room taken) is left to the regular phases.
+func (alloc *Action) allocateReservedAsks(actx *allocateContext) {
+	ssn := alloc.session
+	asks := util.NewPriorityQueue(func(l, r interface{}) bool {
+		lv, rv := l.(*reservedAsk), r.(*reservedAsk)
+		if lv.queue.UID != rv.queue.UID {
+			return ssn.QueueOrderFn(lv.queue, rv.queue)
+		}
+		if lv.job.UID != rv.job.UID {
+			return ssn.JobOrderFn(lv.job, rv.job)
+		}
+		return ssn.TaskOrderFn(lv.task, rv.task)
+	})
+	for jobID, tasks := range actx.tasksNoHardTopology {
+		job := ssn.Jobs[jobID]
+		queue := ssn.Queues[job.Queue]
+		if job == nil || queue == nil {
+			continue
+		}
+		for preview := tasks.Clone(); !preview.Empty(); {
+			task := preview.Pop().(*api.TaskInfo)
+			if alloc.reservedNode(queue, task) != nil {
+				asks.Push(&reservedAsk{queue: queue, job: job, tasks: tasks, task: task})
+			}
+		}
+	}
+	if asks.Empty() {
+		return
+	}
+	klog.V(3).Infof("Try to allocate %d reserved asks on their nominated nodes", asks.Len())
+
+	for !asks.Empty() {
+		ask := asks.Pop().(*reservedAsk)
+		// Re-check at service time: an earlier reserved ask may have taken this node's room.
+		node := alloc.reservedNode(ask.queue, ask.task)
+		if node == nil {
+			continue
+		}
+		stmt := framework.NewStatement(ssn)
+		if err := alloc.allocateResourcesForTask(stmt, ask.task, node, ask.job); err != nil ||
+			(ask.task.Status != api.Allocated && ask.task.Status != api.Pipelined) {
+			stmt.Discard()
+			continue
+		}
+		// The same commit rule as the regular phase: a ready job is committed, a pipelined job's
+		// statement stays applied in the session until it closes, anything else is rolled back.
+		switch {
+		case ssn.JobReady(ask.job):
+			stmt.Commit()
+			ssn.MarkJobDirty(ask.job.UID)
+		case ssn.JobPipelined(ask.job):
+		default:
+			stmt.Discard()
+			continue
+		}
+		klog.V(3).Infof("Reserved ask <%s/%s> placed on its nominated Node <%s>", ask.task.Namespace, ask.task.Name, node.Name)
+		removeTask(ask.tasks, ask.task)
+	}
+}
+
+// reservedNode returns the node a task's nomination still holds for it: the nominated node exists,
+// still carries a pod the scheduler evicted that is terminating, and the task fits its future idle,
+// is allocatable in its queue hierarchy and passes the predicates. Otherwise nil.
+func (alloc *Action) reservedNode(queue *api.QueueInfo, task *api.TaskInfo) *api.NodeInfo {
+	ssn := alloc.session
+	nodeName := task.Pod.Status.NominatedNodeName
+	if nodeName == "" || task.SchGated {
+		return nil
+	}
+	node, found := ssn.Nodes[nodeName]
+	if !found || !hasSchedulerEvictedPod(node) {
+		return nil
+	}
+	if !ssn.Allocatable(queue, task) || !task.InitResreq.LessEqual(node.FutureIdle(), api.Zero) {
+		return nil
+	}
+	if err := ssn.PrePredicateFn(task); err != nil {
+		klog.V(4).Infof("PrePredicate failed for reserved ask <%s/%s>: %v", task.Namespace, task.Name, err)
+		return nil
+	}
+	if err := alloc.predicate(task, node); err != nil {
+		klog.V(4).Infof("Reserved ask <%s/%s> no longer fits its nominated Node <%s>: %v", task.Namespace, task.Name, nodeName, err)
+		return nil
+	}
+	return node
+}
+
+// hasSchedulerEvictedPod reports whether a pod the scheduler evicted (reclaim or preempt) is still
+// terminating on the node. Volcano's evictor marks its victims with the DisruptionTarget condition.
+func hasSchedulerEvictedPod(node *api.NodeInfo) bool {
+	for _, t := range node.Tasks {
+		if t.Status != api.Releasing || t.Pod == nil || t.Pod.DeletionTimestamp == nil {
+			continue
+		}
+		for _, c := range t.Pod.Status.Conditions {
+			if c.Type == v1.DisruptionTarget && c.Status == v1.ConditionTrue && c.Reason == v1.PodReasonPreemptionByScheduler {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeTask drops one task from a worksheet queue, keeping the others in order.
+func removeTask(tasks *util.PriorityQueue, task *api.TaskInfo) {
+	kept := make([]*api.TaskInfo, 0, tasks.Len())
+	for !tasks.Empty() {
+		if t := tasks.Pop().(*api.TaskInfo); t.UID != task.UID {
+			kept = append(kept, t)
+		}
+	}
+	for _, t := range kept {
+		tasks.Push(t)
+	}
 }
 
 func (alloc *Action) buildAllocateContext() *allocateContext {

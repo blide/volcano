@@ -113,7 +113,9 @@ labels everything never returns borrowed capacity, so it should not be grantable
 PriorityClasses are cluster-scoped and can be capped per namespace with a ResourceQuota scope.
 
 Out of scope for this selection: the cost is per node, so it does not combine victims from several
-nodes to free a queue's quota, and nothing holds the freed room for the asker after the session.
+Out of scope for this selection: the cost is per node, so it does not combine victims from several
+nodes to free a queue's quota. Across sessions the freed room is held by the allocate action's
+reserved-ask pass (below), which is why `allocate` must stay ahead of `reclaim` in the action list.
 
 Configuration:
 
@@ -125,3 +127,28 @@ configurations:
       victimSelection: bestFit   # firstFit (default) or bestFit
       maxCandidateNodes: 0       # bestFit only; 0 explores every candidate node
 ```
+
+## Waiting on the nominated node
+
+A pipelined asker is Pending again in the next session while the victims evicted for it are still
+terminating. Two things keep reclaim from evicting again for it, every session, for the whole
+termination grace period. The cache writes the node reclaim pipelined the asker on into the pod's
+`nominatedNodeName` whenever a pipeline followed an eviction, and the evictor marks its victims with
+the DisruptionTarget condition, reason "preemption by scheduler".
+
+The allocate action's reserved-ask pass uses both. Before its nominated-hypernode and regular phases
+it collects the pending tasks whose nomination is live: the nominated node exists, still carries a
+pod the scheduler evicted that is terminating, and the task fits the node's future idle, is
+allocatable in its queue hierarchy and passes the predicates. It visits them in queue, job and task
+order, re-checks the nomination at service time, and places each on its nominated node: bound when
+the node already has idle room, pipelined otherwise, under the regular phase's commit rule. The
+pipelined ask takes that room in the session's accounting, so no other ask, not even one that sorts
+earlier in queue order, is pipelined onto the room this ask paid for; without the pass the room went
+to the first ask in order, which in a failover is often another tenant's over-deserved replacement,
+and the originator reclaimed a second time. A stale nomination (victims gone, room taken) falls
+through to the regular phases and then to reclaim.
+
+This is YuniKorn's reserved allocation in Volcano's terms. It holds only with `allocate` ahead of
+`reclaim`: with reclaim first, a node whose terminating pods were its only reclaimable ones yields no
+plan, the asker is planned afresh and evicts elsewhere, again in every session until the victims are
+gone. The hold is per session and per ask; nothing beyond the nomination is persisted.

@@ -181,6 +181,8 @@ func Test_capacityPlugin_ReclaimVictimSelection(t *testing.T) {
 		priority.PluginName:   priority.New,
 	}
 	defaultActions := []framework.Action{enqueue.New(), reclaim.New(), allocate.New()}
+	// The documented order: allocate ahead of reclaim.
+	documentedActions := []framework.Action{enqueue.New(), allocate.New(), reclaim.New()}
 
 	prioHigh, prioLow := int32(1000), int32(100)
 	pcHigh := util.BuildPriorityClass("high", prioHigh)
@@ -342,6 +344,131 @@ func Test_capacityPlugin_ReclaimVictimSelection(t *testing.T) {
 				ExpectPipeLined: map[string][]string{"ns1/pg-t1-ask": {"n1"}},
 				ExpectEvictNum:  1,
 				ExpectEvicted:   []string{"ns1/t2-x1"},
+			},
+		},
+		// ------------------------------------------------------- waiting on the nominated node
+		{
+			// Requirement. The ask was reclaimed for in a previous session: its victim on n1 is
+			// still terminating and the pod carries n1 as its nominated node. n1 has no other
+			// reclaimable pod. In the documented action order allocate runs before reclaim,
+			// places the ask on its nominated node onto the room the victim is freeing; the job
+			// is no longer starving and reclaim evicts nothing.
+			actions: documentedActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "R1: an ask waits on its nominated node while the victims reclaimed for it terminate",
+				Pods: []*corev1.Pod{
+					vsEvicted("victim-a", "pg-active", "n1", "2"),
+					vsRunning("holder-a", "pg-active", "n1", "2", false, nil),
+					vsRunning("exec-b", "pg-active", "n2", "2", true, nil),
+					vsRunning("holder-b", "pg-active", "n2", "2", false, nil),
+					vsNominated("standby-driver", "pg-standby", "2", "n1"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "4"), vsNode("n2", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          vsTree("8", "8", "0", "8", "4", "8"),
+				ExpectPipeLined: standbyOnN1,
+				ExpectEvictNum:  0,
+			},
+		},
+		{
+			// Requirement. The terminating room on n1 is held for the ask that paid for it:
+			// the reserved pass pipelines the nominated ask there before any regular ask is
+			// considered, and the second ask reclaims its own room on n2.
+			actions: documentedActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "R2: the waiting ask reserves the terminating room against other askers",
+				Pods: []*corev1.Pod{
+					vsEvicted("victim-a", "pg-active", "n1", "2"),
+					vsRunning("holder-a", "pg-active", "n1", "2", false, nil),
+					vsRunning("exec-b", "pg-active", "n2", "2", true, nil),
+					vsRunning("holder-b", "pg-active", "n2", "2", false, nil),
+					vsNominated("standby-driver", "pg-standby", "2", "n1"),
+					vsPending("s1-driver", "pg-s1", "2"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "4"), vsNode("n2", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby, vsRunningPG("pg-s1", "standby")},
+				Queues:          vsTree("8", "8", "0", "8", "4", "8"),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1"}, "ns1/pg-s1": {"n2"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-b"},
+			},
+		},
+		{
+			// Requirement. A stale nomination is no protection: the nominated node's terminating
+			// pod is gone and its room was taken, so the ask is planned afresh and evicts on n2.
+			actions: documentedActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "R3: a stale nomination falls through to reclaim",
+				Pods: []*corev1.Pod{
+					vsRunning("holder-a1", "pg-active", "n1", "2", false, nil),
+					vsRunning("holder-a2", "pg-active", "n1", "2", false, nil),
+					vsRunning("exec-b", "pg-active", "n2", "2", true, nil),
+					vsRunning("holder-b", "pg-active", "n2", "2", false, nil),
+					vsNominated("standby-driver", "pg-standby", "2", "n1"),
+				},
+				Nodes:           []*corev1.Node{vsNode("n1", "4"), vsNode("n2", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          vsTree("8", "8", "0", "8", "4", "8"),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n2"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-b"},
+			},
+		},
+		{
+			// Requirement. The room reclaim freed goes to the ask it was freed for, not to the
+			// first ask in queue order. That order compares the tenants' shares where two leaves
+			// diverge, and the failing-over tenant t1 looks the most over its deserved of all,
+			// because its draining active pods still count as allocated, so another tenant's
+			// over-deserved replacement would sort first and take n1, and the ask that paid for
+			// n1 would reclaim a second time, on n2. The reserved pass places the nominated ask
+			// on n1 before any regular ask; the replacement finds no room and, being over its
+			// deserved, cannot reclaim. Nothing is evicted.
+			actions: documentedActions,
+			check: func(t *testing.T, ssn *framework.Session) {
+				if n := len(ssn.Jobs["ns1/pg-active2"].TaskStatusIndex[api.Pipelined]); n != 0 {
+					t.Errorf("pg-active2 must not be pipelined, got %d tasks", n)
+				}
+			},
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "R4: the ask reclaim evicted for is served before an over-deserved tenant's ask",
+				Pods: []*corev1.Pod{
+					vsEvicted("victim-a", "pg-active1", "n1", "2"),
+					vsRunning("holder-a", "pg-active1", "n1", "2", false, nil),
+					vsRunning("holder-a2", "pg-active1", "n3", "2", false, nil),
+					vsRunning("s1-running", "pg-standby1-run", "n3", "2", false, nil),
+					vsRunning("t2-x1", "pg-active2", "n2", "2", true, nil),
+					vsRunning("t2-x2", "pg-active2", "n2", "2", false, nil),
+					vsNominated("standby-driver", "pg-standby1-ask", "2", "n1"),
+					vsPending("t2-exec-new", "pg-active2", "2"),
+				},
+				Nodes: []*corev1.Node{vsNode("n1", "4"), vsNode("n2", "4"), vsNode("n3", "4")},
+				PodGroups: []*schedulingv1beta1.PodGroup{
+					vsRunningPG("pg-active1", "active1"), vsRunningPG("pg-standby1-run", "standby1"),
+					vsAskPG("pg-standby1-ask", "standby1"), vsRunningPG("pg-active2", "active2"),
+				},
+				Queues:          vsTwoTenants(),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby1-ask": {"n1"}},
+				ExpectEvictNum:  0,
+			},
+		},
+		{
+			// Requirement. The reserved pass binds, not only pipelines: when the nominated node
+			// already has idle room next to the terminating victim, the ask is bound there and
+			// nothing else moves.
+			actions: documentedActions,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "R5: a reserved ask that already fits the idle room is bound",
+				Pods: []*corev1.Pod{
+					vsEvicted("victim-a", "pg-active", "n1", "2"),
+					vsNominated("standby-driver", "pg-standby", "2", "n1"),
+					vsPending("s1-driver", "pg-s1", "2"),
+				},
+				Nodes:          []*corev1.Node{vsNode("n1", "4")},
+				PodGroups:      []*schedulingv1beta1.PodGroup{pgActive, pgStandby, vsRunningPG("pg-s1", "standby")},
+				Queues:         vsTree("8", "8", "0", "8", "4", "8"),
+				ExpectBindsNum: 1,
+				ExpectBindMap:  map[string]string{"ns1/standby-driver": "n1"},
+				ExpectEvictNum: 0,
 			},
 		},
 	}
