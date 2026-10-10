@@ -43,9 +43,11 @@ const (
 	// evicting that node's victims. Candidate order is not stable, so which node that is, and
 	// how expensive its victims are, is incidental.
 	VictimSelectionFirstFit = "firstFit"
-	// VictimSelectionBestFit explores every candidate node and commits the cheapest victim set:
-	// lowest highest-victim-priority first, then fewest victims. Priority is thereby a cost rather
-	// than an exemption: an expensive pod is taken only when no node can be served without it.
+	// VictimSelectionBestFit explores every candidate node and commits the cheapest victim set,
+	// ranked with the keys of the per-node victim order: victim queue first, then lowest
+	// highest-victim priority, then fewest victims. Priority is thereby a cost rather than an
+	// exemption, and one local to the queue that uses it: an expensive pod is taken only when no
+	// node can be served without it, and never ahead of another queue's pods on that account.
 	VictimSelectionBestFit = "bestFit"
 	// MaxCandidateNodesKey bounds how many nodes with a viable plan bestFit explores for one
 	// asker before committing; 0 (default) means all candidate nodes.
@@ -228,6 +230,7 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		predicateNodesByShardFlattened = append(predicateNodesByShardFlattened, nodes...)
 	}
 
+	queue := ssn.Queues[job.Queue]
 	var best *nodePlan
 	planned := 0
 	for _, n := range predicateNodesByShardFlattened {
@@ -245,7 +248,7 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		// bestFit: roll the exploration back and keep the plan; the winner is replayed below.
 		plan.stmt.Discard()
 		plan.stmt = nil
-		if plan.cheaperThan(best) {
+		if plan.cheaperThan(best, ssn, queue) {
 			best = plan
 		}
 		planned++
@@ -280,11 +283,43 @@ func (p *nodePlan) maxPriority() int32 {
 	return m
 }
 
-// cheaperThan orders plans: lowest highest-victim priority, then fewest victims, then node name so
-// the choice does not depend on the candidate order, which is not stable.
-func (p *nodePlan) cheaperThan(o *nodePlan) bool {
+// lastVictimQueue is the plan's most protected victim queue: among the queues its victims belong
+// to, the one the victim queue order ranks last for this asker. A plan is represented by the queue
+// it hurts most, as it is by its highest victim priority. Nil when the plan has no victims or none
+// of them has a job in the session.
+func (p *nodePlan) lastVictimQueue(ssn *framework.Session, asker *api.QueueInfo) *api.QueueInfo {
+	var last *api.QueueInfo
+	for _, v := range p.victims {
+		job, found := ssn.Jobs[v.Job]
+		if !found {
+			continue
+		}
+		q := ssn.Queues[job.Queue]
+		if q == nil {
+			continue
+		}
+		if last == nil || (last.UID != q.UID && ssn.VictimQueueOrderFn(last, q, asker)) {
+			last = q
+		}
+	}
+	return last
+}
+
+// cheaperThan orders plans with the keys the per-node victim order already uses, so that a
+// PriorityClass stays local to the queue that uses it: a plan without victims first; then the
+// plan whose most protected victim queue the victim queue order evicts earlier (for the capacity
+// plugin the queue nearest the asker in the hierarchy, then the one with the higher share); only
+// between plans hurting the same queue the lowest highest-victim priority; then fewest victims;
+// then node name so the choice does not depend on the candidate order, which is not stable.
+func (p *nodePlan) cheaperThan(o *nodePlan, ssn *framework.Session, asker *api.QueueInfo) bool {
 	if o == nil {
 		return true
+	}
+	if (len(p.victims) == 0) != (len(o.victims) == 0) {
+		return len(p.victims) == 0
+	}
+	if pq, oq := p.lastVictimQueue(ssn, asker), o.lastVictimQueue(ssn, asker); pq != nil && oq != nil && pq.UID != oq.UID {
+		return ssn.VictimQueueOrderFn(pq, oq, asker)
 	}
 	if a, b := p.maxPriority(), o.maxPriority(); a != b {
 		return a < b

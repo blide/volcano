@@ -284,6 +284,66 @@ func Test_capacityPlugin_ReclaimVictimSelection(t *testing.T) {
 				ExpectEvicted:   []string{"ns1/exec-b"},
 			},
 		},
+		// ------------------------------------------------------- the ladder is fenced by queue
+		{
+			// Requirement. The PriorityClass ladder is local to the tenant that uses it. Across
+			// tenants the victim queue order decides, as it does within a node: for the capacity
+			// plugin the queue nearest the asker in the hierarchy first. t1's own active queue is
+			// nearer to standby1 than t2 is, so its high-priority executor on n1 is evicted
+			// although t2's low-priority executor on n2 would score cheaper by class value.
+			priority: true,
+			bestFit:  true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "F1: bestFit ranks victim queues before pod priority across tenants",
+				Pods: []*corev1.Pod{
+					vsRunning("exec-a", "pg-active1", "n1", "2", true, &prioHigh),
+					vsRunning("exec-t2", "pg-active2", "n2", "2", true, &prioLow),
+					vsPending("standby-driver", "pg-standby1-ask", "2"),
+				},
+				Nodes: []*corev1.Node{vsNode("n1", "2"), vsNode("n2", "2")},
+				PodGroups: []*schedulingv1beta1.PodGroup{
+					vsRunningPG("pg-active1", "active1"), vsAskPG("pg-standby1-ask", "standby1"), vsRunningPG("pg-active2", "active2"),
+				},
+				Queues:          vsTwoTenants(),
+				PriClass:        priClasses,
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby1-ask": {"n1"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-a"},
+			},
+		},
+		{
+			// Requirement. Between two foreign tenants at the same distance the victim queue
+			// order falls back to the reverse of the allocation order: the tenant with the
+			// higher share is evicted first. t2 (allocated 4 of deserved 2) ranks above t3
+			// (allocated 3 of deserved 2), so t2's high-priority pod on n1 is evicted although
+			// t3's low-priority pod on n2 would score cheaper by class value.
+			priority: true,
+			bestFit:  true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "F2: between foreign tenants the higher share is evicted first regardless of class",
+				Pods: []*corev1.Pod{
+					vsRunning("t2-x1", "pg-t2", "n1", "2", true, &prioHigh),
+					vsRunning("t2-x2", "pg-t2", "n3", "2", false, nil),
+					vsRunning("t3-x1", "pg-t3", "n2", "2", true, &prioLow),
+					vsRunning("t3-x2", "pg-t3", "n4", "1", false, nil),
+					vsPending("t1-driver", "pg-t1-ask", "2"),
+				},
+				Nodes: []*corev1.Node{vsNode("n1", "2"), vsNode("n2", "2"), vsNode("n3", "2"), vsNode("n4", "1")},
+				PodGroups: []*schedulingv1beta1.PodGroup{
+					vsAskPG("pg-t1-ask", "t1-leaf"), vsRunningPG("pg-t2", "t2-leaf"), vsRunningPG("pg-t3", "t3-leaf"),
+				},
+				Queues: []*schedulingv1beta1.Queue{
+					vsQueue("root", "", "", ""),
+					vsQueue("t1", "root", "4", "8"), vsQueue("t1-leaf", "t1", "4", "8"),
+					vsQueue("t2", "root", "2", "8"), vsQueue("t2-leaf", "t2", "2", "8"),
+					vsQueue("t3", "root", "2", "8"), vsQueue("t3-leaf", "t3", "2", "8"),
+				},
+				PriClass:        priClasses,
+				ExpectPipeLined: map[string][]string{"ns1/pg-t1-ask": {"n1"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/t2-x1"},
+			},
+		},
 	}
 
 	for i, c := range cases {

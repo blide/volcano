@@ -88,19 +88,26 @@ The action argument `victimSelection` picks the node:
   only reclaimable pod on an early node is evicted although cheaper victims exist on the next node,
   which is how a Spark driver gets reclaimed while its executors were available.
 - `bestFit`: every candidate node is planned the same way, each plan is rolled back, and the cheapest
-  one is replayed and committed. A plan's cost is the highest pod priority among its victims, then
-  the number of victims, then the node name so the result does not depend on the candidate order. A
-  node that fits without eviction costs less than any eviction and ends the search. The argument
-  `maxCandidateNodes` bounds how many nodes with a viable plan are explored before committing;
-  `0` (default) explores all candidates.
+  one is replayed and committed. Plans are ranked with the keys the per-node victim order already
+  uses, so the ranking is fenced the same way: a plan without victims first; then the plan whose
+  most protected victim queue (the one the victim queue order ranks last among the queues its
+  victims belong to) the victim queue order evicts earlier, which for the capacity plugin is the
+  queue nearest the asker in the hierarchy, then the one with the higher share; only between plans
+  hurting the same queue the lowest highest-victim pod priority; then the number of victims; then
+  the node name so the result does not depend on the candidate order. A node that fits without
+  eviction costs less than any eviction and ends the search. The argument `maxCandidateNodes`
+  bounds how many nodes with a viable plan are explored before committing; `0` (default) explores
+  all candidates.
 
 The rollback-and-replay shape keeps the per-node isolation introduced for first-fit: evictions on
 nodes that end up unused are never committed, and the replay runs in the same session with nothing
 in between, so the recorded victims are still Running when they are evicted for real.
 
-Priority is thereby a cost rather than an exemption. A high-priority driver is taken only when no
-node can be served by lower-priority victims, and abusing a PriorityClass buys "evicted last", never
-"never evicted". The hard filter `volcano.sh/preemptable: "false"` remains for the few pods that
+Priority is thereby a cost rather than an exemption, and a cost local to the queue that uses it. A
+high-priority driver is taken only when no node can be served by its queue's lower-priority pods,
+abusing a PriorityClass buys "evicted last among my own pods", never "never evicted" and never
+"after the other tenants": between queues the victim queue order decides, as it does within a
+node. The hard filter `volcano.sh/preemptable: "false"` remains for the few pods that
 truly must not move; because it is user-settable and no queue setting overrides it, a tenant that
 labels everything never returns borrowed capacity, so it should not be grantable to users.
 PriorityClasses are cluster-scoped and can be capped per namespace with a ResourceQuota scope.

@@ -100,10 +100,14 @@ job spread over nodes, for example a Spark driver on one node and its executors 
 driver can be evicted while an executor would have freed the same amount.
 
 Setting the reclaim action argument `victimSelection: bestFit` makes reclaim plan every candidate
-node and commit the one whose victims cost least: the lowest highest-victim priority first, then the
-fewest victims; a node that fits without eviction wins outright. Priority thereby becomes a cost that
-reclaim pays as late as possible, instead of the `volcano.sh/preemptable: "false"` label, which
-exempts a pod altogether and lets a tenant that labels everything keep borrowed capacity for good.
+node and commit the one whose victims cost least, ranked the way victims are already ranked within a
+node: the victim queue first (for the capacity plugin the queue nearest the asker in the hierarchy,
+then the one with the higher share), then the lowest highest-victim priority, then the fewest
+victims; a node that fits without eviction wins outright. Priority thereby becomes a cost that
+reclaim pays as late as possible among a queue's own pods, instead of the
+`volcano.sh/preemptable: "false"` label, which exempts a pod altogether and lets a tenant that
+labels everything keep borrowed capacity for good. The class value never ranks one tenant's pods
+against another's.
 
 ```yaml
 kind: ConfigMap
