@@ -1,5 +1,7 @@
 # Quota-aware reclaim
 
+Status: implemented in the reclaim action behind `crossNodeVictims`; gap table section L.
+
 ## Motivation
 
 The reclaim action frees room one node at a time. For an ask it walks the candidate nodes and, on
@@ -155,21 +157,19 @@ is the only blocker and the round still applies.
 1. Quota plugin: the ancestor form of its allocatable check (see quota-plugin.md), sharing the
    per-ancestor loop with the leaf form.
 2. Reclaim action: argument parsing; `reclaimerFitsOnNode` loses the queue term when the round is
-   on; `quotaRound(ssn, plan, queue, task, candidates)` evicting into the plan's statement;
-   `crossNodeReclaimees` building the candidate list once per ask; integration in `planOnNode`
-   before the pipeline, and in `replayPlan` through the recorded victims.
-3. Tests, gap table section L:
+   on; `quotaRound` evicting into the plan's statement; `reclaimeesEverywhere` building the
+   candidate list once per ask; integration in `planOnNode` before the pipeline, and in
+   `replayPlan` through the recorded victims.
+3. Tests, gap table section L (`Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation`):
    - L1: G13 served, both holders evicted, pipelined on the node with room.
-   - L2: G14 served instead of dequeued.
+   - L2: G14 served instead of dequeued, verdict succeeded.
    - L3: G16 unchanged, physical fragmentation still fails and dequeues.
-   - L4: two tenants, the sibling's holder on another node is taken before another tenant's
-     over-deserved pod that is outside the blocked subtree.
-   - L5: shortfall 2c with two 2c holders on another node, exactly one is evicted.
-   - L6: gang veto across nodes takes the executor, not the driver.
-   - L7: bestFit with the quota round, node choice by the physical victims' cost.
-   - L8: `ancestorReclaimLevel: 2` applied to cross-node candidates.
-   - L9: two sessions with `reserveDeserved`, the freed quota is taken by the ask, not by the
-     sibling's replacement.
-   - L10: no admissible victim in the blocked subtree, verdict `ReclaimFailed`, dequeued.
+   - L4: no eviction outside the blocked subtree when it cannot be relieved: a foreign
+     over-deserved pod would make the ask fit physically, the tenant's own reclaimable usage
+     is short of the shortfall, nothing is evicted and the trial is reverted.
+   - L5: shortfall 2c with two 2c holders on other nodes, only the cheaper one is evicted.
+   - L6: gang's veto across nodes takes the executor, not the driver.
+   Not covered yet: bestFit with the round, `ancestorReclaimLevel` on cross-node candidates, the
+   two-session hold with `reserveDeserved`.
 4. Docs: this document, the reclaim design's "Victim selection" section, the dequeue design's
    "remaining structural limit" marked implemented, the user guide's reclaim configuration.

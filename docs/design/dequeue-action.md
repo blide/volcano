@@ -181,12 +181,13 @@ implemented yet.
 
 ### The remaining structural limit
 
-- Reclaim frees quota only with victims on the node it is trying (G13). The trial recovers such a
-  job instead of leaving it stuck, but does not serve it. The fix is designed in
-  [quota-aware-reclaim.md](quota-aware-reclaim.md): a quota round after the node round, behind the
-  reclaim action argument `crossNodeVictims`, that evicts the cheapest admissible victims under the
-  blocking ancestor from any node until the hierarchy admits the ask, asking the
-  [quota plugin](quota-plugin.md) which ancestor it is relieving. Not implemented yet.
+- Reclaim freed quota only with victims on the node it was trying (G13). Implemented: the quota
+  round of the reclaim action, behind `crossNodeVictims`, evicts the cheapest admissible victims
+  under the blocking ancestor from any node until the hierarchy admits the ask, asking the
+  [quota plugin](quota-plugin.md) which ancestor it is relieving; see
+  [quota-aware-reclaim.md](quota-aware-reclaim.md) and gap table section L. The trial admission and
+  the round now measure the same thing, so the dequeue action reverts only what no over-deserved
+  holder anywhere can clear.
 
 ### Victim choice across nodes: cost, not exemption
 

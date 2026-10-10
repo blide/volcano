@@ -153,3 +153,25 @@ The reservation never exceeds a parent's own `deserved`, so a child whose `deser
 parent guarantees is reserved only the parent's remainder. Flat queues are not affected: the root has no
 `capability` unless one is set.
 
+## Free quota with victims from any node
+
+The `reclaim` action evicts on one node per task, and without help it can relieve an ancestor's
+`capability` only with victims that happen to run on the node it is trying. With the quota plugin in
+place, the reclaim action argument `crossNodeVictims: true` adds a quota round: once the task fits a
+node physically, victims under the blocking ancestor are evicted from any node, cheapest first, until
+the hierarchy admits the task. The round asks this plugin which ancestor blocks, stops at the first
+pass, never evicts outside the blocked subtree, and respects the capacity plugin's victim rules and the
+gang plugin's veto. `maxCrossNodeVictims` bounds the victims one task may take (`0` = unbounded); on
+reaching it the task is not served rather than partially paid for.
+
+```yaml
+configurations:
+  - name: reclaim
+    arguments:
+      crossNodeVictims: true
+      maxCrossNodeVictims: 0
+```
+
+With `enqueueAncestorCapReclaim`, the admission trial and the quota round measure the same thing, so
+the `dequeue` action only reverts admissions that no over-deserved holder anywhere can serve. See the
+[design](../design/quota-aware-reclaim.md).

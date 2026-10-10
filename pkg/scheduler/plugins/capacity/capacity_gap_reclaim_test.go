@@ -94,6 +94,8 @@ type gapCase struct {
 	// enable the capacity plugin's reserveDeserved argument (owed deserved share charged to the
 	// allocatable check at every ancestor).
 	reserveDeserved bool
+	// crossNode enables the reclaim action's quota round (crossNodeVictims).
+	crossNode bool
 	// actions overrides the action sequence. The default is enqueue, reclaim, allocate, with
 	// dequeue appended when enqueueReclaim is set (the relaxed admission is a trial that dequeue
 	// reverts). config is passed to RegisterSession for action arguments.
@@ -1704,6 +1706,145 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				ExpectEvictNum: 0,
 			},
 		},
+		// ---------------------------------------------------------------- L. quota round
+		{
+			// Requirement. G13 served: the tenant is at its cap, its over-deserved child holds 2c on
+			// each node, the 4c ask fits either node physically. The node round takes nothing (the
+			// node has room), the quota round evicts both holders wherever they run, and the ask is
+			// pipelined on the node it was planned on.
+			crossNode: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:            "L1: victims spread over nodes are evicted for the ask's quota",
+				Pods:            []*corev1.Pod{holder1, holder2OnN2, ask4},
+				Nodes:           []*corev1.Node{n1, gapNode("n2", "8")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyInqueue4},
+				Queues:          failoverGapTree.queues(),
+				ExpectStatus:    standbyPhase(scheduling.PodGroupInqueue),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1", "n2"}},
+				ExpectEvictNum:  2,
+				ExpectEvicted:   []string{"ns1/exec-1", "ns1/exec-2"},
+			},
+		},
+		{
+			// Requirement. G14 served instead of dequeued: the trial admission and the quota round
+			// now measure the same thing, so the admitted job is served in the admission session.
+			crossNode:      true,
+			enqueueReclaim: true,
+			check:          verdictIs(api.ReclaimSucceeded),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:            "L2: a trial admission is served by the quota round, not dequeued",
+				Pods:            []*corev1.Pod{holder1, holder2OnN2, ask4},
+				Nodes:           []*corev1.Node{n1, gapNode("n2", "8")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues:          failoverGapTree.queues(),
+				ExpectStatus:    standbyPhase(scheduling.PodGroupInqueue),
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1", "n2"}},
+				ExpectEvictNum:  2,
+				ExpectEvicted:   []string{"ns1/exec-1", "ns1/exec-2"},
+			},
+		},
+		{
+			// Requirement. G16 unchanged: physical fragmentation is not quota. No node can host the
+			// 4c ask even with every victim gone, so nothing is evicted and the trial is reverted.
+			crossNode:      true,
+			enqueueReclaim: true,
+			check:          allOf(verdictIs(api.ReclaimFailed), dequeuedWith(dequeue.DequeuedReasonReclaimFailed)),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name:      "L3: fragmented victims still fail and the job is dequeued",
+				Pods:      []*corev1.Pod{holder1, holder2OnN2, ask4},
+				Nodes:     []*corev1.Node{gapNode("n1", "3"), gapNode("n2", "3")},
+				PodGroups: []*schedulingv1beta1.PodGroup{pgExec1MinRes, pgExec2MinRes, pgStandbyMinRes4},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("active", "root", "0", "8"),
+					gapQueue("standby", "root", "4", "8"),
+				},
+				ExpectStatus:   standbyPhase(scheduling.PodGroupPending),
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. Only victims under the blocking ancestor count. t1 is at its cap with 4c
+			// of usage, 2c of it reclaimable (exec-a on n2) and 2c not; the 4c ask is admitted for a
+			// trial (its leaf is empty and entitled) and needs 4c of t1's usage gone. t2's
+			// over-deserved pod on n1 is admissible by share and would make the ask fit n1
+			// physically, but evicting it relieves nothing for t1, so the round stops short, every
+			// tentative eviction is rolled back, and the trial is reverted.
+			crossNode:      true,
+			enqueueReclaim: true,
+			check:          allOf(verdictIs(api.ReclaimFailed), dequeuedWith(dequeue.DequeuedReasonReclaimFailed)),
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "L4: no eviction outside the blocked subtree when it cannot be relieved",
+				Pods: []*corev1.Pod{
+					util.BuildPod(gapNS, "t2-x", "n1", corev1.PodRunning, cpuMem("2"), "pg-active2", preemptableLabel(true), map[string]string{}),
+					util.BuildPod(gapNS, "exec-a", "n2", corev1.PodRunning, cpuMem("2"), "pg-active1", preemptableLabel(true), map[string]string{}),
+					util.BuildPod(gapNS, "holder-a", "n3", corev1.PodRunning, cpuMem("2"), "pg-active1", preemptableLabel(false), map[string]string{}),
+					gapPendingPod("standby-driver", "pg-standby", "4"),
+				},
+				Nodes: []*corev1.Node{gapNode("n1", "4"), gapNode("n2", "4"), gapNode("n3", "2")},
+				PodGroups: []*schedulingv1beta1.PodGroup{
+					gapMinResPG("pg-active1", "active1", cpuMem("4"), schedulingv1beta1.PodGroupRunning),
+					gapMinResPG("pg-standby", "standby1", cpuMem("4"), schedulingv1beta1.PodGroupPending),
+					gapMinResPG("pg-active2", "active2", cpuMem("2"), schedulingv1beta1.PodGroupRunning),
+				},
+				Queues: []*schedulingv1beta1.Queue{
+					gapQueue("root", "", "", ""),
+					gapQueue("t1", "root", "4", "4"),
+					gapQueue("active1", "t1", "0", "4"),
+					gapQueue("standby1", "t1", "4", "4"),
+					gapQueue("t2", "root", "2", "8"),
+					gapQueue("active2", "t2", "0", "8"),
+				},
+				ExpectStatus:   standbyPhase(scheduling.PodGroupPending),
+				ExpectEvictNum: 0,
+			},
+		},
+		{
+			// Requirement. The round stops at the first pass: the tenant is 2c short and its child
+			// holds two 2c executors on other nodes; only the cheaper one is evicted, and the ask
+			// lands on a node with room without any node-round victim.
+			crossNode: true,
+			priority:  true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "L5: the quota round evicts only what the shortfall needs",
+				Pods: []*corev1.Pod{
+					util.BuildPodWithPriority(gapNS, "exec-a1", "n2", corev1.PodRunning, cpuMem("2"), "pg-active", preemptableLabel(true), map[string]string{}, &prioLow),
+					util.BuildPodWithPriority(gapNS, "exec-a2", "n3", corev1.PodRunning, cpuMem("2"), "pg-active", preemptableLabel(true), map[string]string{}, &prioHigh),
+					gapPendingPod("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{gapNode("n1", "4"), gapNode("n2", "4"), gapNode("n3", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          failoverGapTree.queues(),
+				PriClass:        []*schedulingv1.PriorityClass{pcHigh, pcLow},
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1", "n2", "n3"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-a1"},
+			},
+		},
+		{
+			// Requirement. Gang's veto applies across nodes in the quota round: the active job has
+			// a driver on n2 and an executor on n3, minAvailable 1, so gang admits exactly one
+			// victim, in arrival order; the candidates arrive cheapest first, so the executor is
+			// taken and the driver kept, wherever they run.
+			crossNode:   true,
+			priority:    true,
+			gangReclaim: true,
+			TestCommonStruct: uthelper.TestCommonStruct{
+				Name: "L6: gang's veto lands on the driver, not the executor, across nodes",
+				Pods: []*corev1.Pod{
+					util.BuildPodWithPriority(gapNS, "driver-a", "n2", corev1.PodRunning, cpuMem("2"), "pg-active", preemptableLabel(true), map[string]string{}, &prioHigh),
+					util.BuildPodWithPriority(gapNS, "exec-a", "n3", corev1.PodRunning, cpuMem("2"), "pg-active", preemptableLabel(true), map[string]string{}, &prioLow),
+					gapPendingPod("standby-driver", "pg-standby", "2"),
+				},
+				Nodes:           []*corev1.Node{gapNode("n1", "4"), gapNode("n2", "4"), gapNode("n3", "4")},
+				PodGroups:       []*schedulingv1beta1.PodGroup{pgActive, pgStandby},
+				Queues:          failoverGapTree.queues(),
+				PriClass:        []*schedulingv1.PriorityClass{pcHigh, pcLow},
+				ExpectPipeLined: map[string][]string{"ns1/pg-standby": {"n1", "n2", "n3"}},
+				ExpectEvictNum:  1,
+				ExpectEvicted:   []string{"ns1/exec-a"},
+			},
+		},
 	}
 
 	for i, c := range cases {
@@ -1715,7 +1856,14 @@ func Test_capacityPlugin_ReclaimOnAncestorCapacityStarvation(t *testing.T) {
 				featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.SchedulingGatesQueueAdmission, true)
 			}
 			c.Plugins = plugins
-			ssn := c.RegisterSession(c.tiers(), c.config)
+			config := c.config
+			if c.crossNode {
+				config = append(append([]conf.Configuration{}, config...), conf.Configuration{
+					Name:      reclaim.New().Name(),
+					Arguments: map[string]interface{}{reclaim.CrossNodeVictimsKey: true},
+				})
+			}
+			ssn := c.RegisterSession(c.tiers(), config)
 			defer c.Close()
 			caseActions := actions
 			switch {

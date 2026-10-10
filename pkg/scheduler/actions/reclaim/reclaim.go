@@ -54,12 +54,22 @@ const (
 	// MaxCandidateNodesKey bounds how many nodes with a viable plan bestFit explores for one
 	// asker before committing; 0 (default) means all candidate nodes.
 	MaxCandidateNodesKey = "maxCandidateNodes"
+	// CrossNodeVictimsKey enables the quota round: when the asker fits a node physically but its
+	// queue hierarchy still refuses it, victims under the blocking ancestor are evicted from any
+	// node, cheapest first, until the hierarchy admits it. The node round then evicts only what
+	// the node needs. Default false.
+	CrossNodeVictimsKey = "crossNodeVictims"
+	// MaxCrossNodeVictimsKey bounds the victims one asker may take in the quota round; reaching it
+	// fails the asker on that node. 0 (default) means unbounded.
+	MaxCrossNodeVictimsKey = "maxCrossNodeVictims"
 )
 
 type Action struct {
 	enablePredicateErrorCache bool
 	victimSelection           string
 	maxCandidateNodes         int
+	crossNodeVictims          bool
+	maxCrossNodeVictims       int
 }
 
 func New() *Action {
@@ -93,6 +103,13 @@ func (ra *Action) parseArguments(ssn *framework.Session) {
 	arguments.GetInt(&ra.maxCandidateNodes, MaxCandidateNodesKey)
 	if ra.maxCandidateNodes < 0 {
 		ra.maxCandidateNodes = 0
+	}
+	ra.crossNodeVictims = false
+	arguments.GetBool(&ra.crossNodeVictims, CrossNodeVictimsKey)
+	ra.maxCrossNodeVictims = 0
+	arguments.GetInt(&ra.maxCrossNodeVictims, MaxCrossNodeVictimsKey)
+	if ra.maxCrossNodeVictims < 0 {
+		ra.maxCrossNodeVictims = 0
 	}
 }
 
@@ -271,12 +288,17 @@ func (ra *Action) reclaimForTask(ssn *framework.Session, stmt *framework.Stateme
 		predicateNodesByShardFlattened = append(predicateNodesByShardFlattened, nodes...)
 	}
 
+	var candidates []*api.TaskInfo
+	if ra.crossNodeVictims {
+		candidates = reclaimeesEverywhere(ssn, job, task)
+	}
+
 	var best *nodePlan
 	planned := 0
 	for _, n := range predicateNodesByShardFlattened {
 		klog.V(3).Infof("Considering Task <%s/%s> on Node <%s>.", task.Namespace, task.Name, n.Name)
 
-		plan, seen := planOnNode(ssn, queue, task, job, n)
+		plan, seen := ra.planOnNode(ssn, queue, task, job, n, candidates)
 		victimsSeen = victimsSeen || seen
 		if plan == nil {
 			continue
@@ -374,11 +396,13 @@ func (p *nodePlan) cheaperThan(o *nodePlan, ssn *framework.Session, asker *api.Q
 
 // planOnNode explores serving the task on node: it evicts that node's admissible victims, cheapest
 // first, into a per-node statement until the task fits the node and its queue hierarchy, then
-// pipelines the task there. It returns the open plan, or nil after rolling the statement back
-// when the node cannot serve the task; and whether the plugins admitted any victim on the node.
-func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo) (plan *nodePlan, victimsSeen bool) {
+// pipelines the task there. With crossNodeVictims the node round stops at the physical fit and the
+// quota round (quotaRound) relieves the hierarchy with victims from any node. It returns the open
+// plan, or nil after rolling the statement back when the node cannot serve the task; and whether
+// the plugins admitted any victim for the task.
+func (ra *Action) planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, job *api.JobInfo, n *api.NodeInfo, candidates []*api.TaskInfo) (plan *nodePlan, victimsSeen bool) {
 	reclaimees := reclaimeesOnNode(ssn, job, task, n)
-	if len(reclaimees) == 0 {
+	if len(reclaimees) == 0 && !ra.crossNodeVictims {
 		klog.V(4).Infof("No reclaimees on Node <%s>.", n.Name)
 		return nil, false
 	}
@@ -394,8 +418,11 @@ func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo
 	resreq := task.InitResreq.Clone()
 	reclaimed := api.EmptyResource()
 
+	// With the quota round the node round only has to make the task fit the node; the hierarchy
+	// is relieved afterwards with the cheapest victims wherever they run.
+	queueTerm := !ra.crossNodeVictims
 	availableResources := n.FutureIdle()
-	reclaimerFits := reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources)
+	reclaimerFits := reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources, queueTerm)
 
 	// Use a per-node statement so that evictions are isolated to this node. Only a plan whose
 	// Pipeline succeeds is ever merged into the caller's statement; everything else is discarded
@@ -410,7 +437,7 @@ func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo
 		plan.evictionOccurred = true
 		reclaimed.Add(reclaimee.Resreq)
 		availableResources.Add(reclaimee.Resreq)
-		reclaimerFits = reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources)
+		reclaimerFits = reclaimerFitsOnNode(ssn, queue, task, n, resreq, availableResources, queueTerm)
 	}
 
 	klog.V(3).Infof("Reclaimed <%v> for task <%s/%s> requested <%v>, and Node <%s> availableResources <%v>.", reclaimed, task.Namespace, task.Name, task.InitResreq, n.Name, availableResources)
@@ -418,6 +445,14 @@ func planOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo
 	if !reclaimerFits {
 		plan.stmt.Discard()
 		return nil, victimsSeen
+	}
+	if ra.crossNodeVictims && !ssn.Allocatable(queue, task) {
+		seen, ok := ra.quotaRound(ssn, plan, queue, task, candidates)
+		victimsSeen = victimsSeen || seen
+		if !ok {
+			plan.stmt.Discard()
+			return nil, victimsSeen
+		}
 	}
 	if err := plan.stmt.Pipeline(task, n.Name, plan.evictionOccurred); err != nil {
 		klog.Errorf("Failed to pipeline Task <%s/%s> on Node <%s>: %v", task.Namespace, task.Name, n.Name, err)
@@ -483,10 +518,126 @@ func reclaimeesOnNode(ssn *framework.Session, job *api.JobInfo, task *api.TaskIn
 // lets reclaim serve an ask starved by an ancestor's capability rather than by node capacity
 // (volcano-sh/volcano#4817): every tentative Evict runs the plugins' DeallocateFunc handlers, so
 // ssn.Allocatable already sees the victims chosen so far. Mirrors preemptorFitsOnNode in preempt.
-func reclaimerFitsOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, node *api.NodeInfo, resreq, availableResources *api.Resource) bool {
-	return ssn.Allocatable(queue, task) &&
+func reclaimerFitsOnNode(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo, node *api.NodeInfo, resreq, availableResources *api.Resource, queueTerm bool) bool {
+	return (!queueTerm || ssn.Allocatable(queue, task)) &&
 		resreq.LessEqual(availableResources, api.Zero) &&
 		ssn.PredicateFn(task, node) == nil
+}
+
+// quotaRound relieves the task's queue hierarchy after the node round: while ssn.Allocatable still
+// refuses the task, it evicts into the plan the cheapest admissible candidate whose queue lies under
+// the deepest blocking ancestor, from whatever node it runs on, re-reading the blocker after each
+// eviction. Every tentative eviction runs the plugins' deallocate handlers, so the quota plugin's
+// counters, and with them ssn.Allocatable, see each victim as it is chosen. It returns whether the
+// plugins admitted any candidate and whether the hierarchy admits the task at the end.
+func (ra *Action) quotaRound(ssn *framework.Session, plan *nodePlan, queue *api.QueueInfo, task *api.TaskInfo, candidates []*api.TaskInfo) (victimsSeen, ok bool) {
+	taken := map[api.TaskID]struct{}{}
+	for _, v := range plan.victims {
+		taken[v.UID] = struct{}{}
+	}
+	remaining := make([]*api.TaskInfo, 0, len(candidates))
+	for _, c := range candidates {
+		if _, found := taken[c.UID]; !found {
+			remaining = append(remaining, c)
+		}
+	}
+	// Admission is evaluated now, after the node round, so the plugins' cumulative counters
+	// include the node's victims.
+	admitted := ssn.Reclaimable(task, remaining)
+	victimsSeen = len(admitted) > 0
+	if len(admitted) == 0 {
+		klog.V(3).Infof("Quota round for Task <%s/%s>: no admissible victims anywhere", task.Namespace, task.Name)
+		return false, false
+	}
+	ordered := make([]*api.TaskInfo, 0, len(admitted))
+	for q := ssn.BuildVictimsPriorityQueue(admitted, task); !q.Empty(); {
+		ordered = append(ordered, q.Pop().(*api.TaskInfo))
+	}
+
+	evicted := 0
+	for !ssn.Allocatable(queue, task) {
+		if ra.maxCrossNodeVictims > 0 && evicted >= ra.maxCrossNodeVictims {
+			klog.V(3).Infof("Quota round for Task <%s/%s>: %d victims reached %s", task.Namespace, task.Name, evicted, MaxCrossNodeVictimsKey)
+			return victimsSeen, false
+		}
+		blocker := deepestBlocker(ssn, queue, task)
+		if blocker == nil {
+			klog.V(3).Infof("Quota round for Task <%s/%s>: the hierarchy refuses the task but names no blocking queue", task.Namespace, task.Name)
+			return victimsSeen, false
+		}
+		var victim *api.TaskInfo
+		for i, c := range ordered {
+			if c == nil {
+				continue
+			}
+			if j := ssn.Jobs[c.Job]; j != nil && isUnder(ssn, j.Queue, blocker.UID) {
+				victim, ordered[i] = c, nil
+				break
+			}
+		}
+		if victim == nil {
+			klog.V(3).Infof("Quota round for Task <%s/%s>: no admissible victim under blocking queue <%s>", task.Namespace, task.Name, blocker.Name)
+			return victimsSeen, false
+		}
+		klog.V(3).Infof("Quota round: reclaim Task <%s/%s> on Node <%s> for Task <%s/%s>, relieving queue <%s>",
+			victim.Namespace, victim.Name, victim.NodeName, task.Namespace, task.Name, blocker.Name)
+		plan.stmt.Evict(victim, "reclaim")
+		plan.victims = append(plan.victims, victim)
+		plan.evictionOccurred = true
+		evicted++
+	}
+	return victimsSeen, true
+}
+
+// deepestBlocker walks the task's queue ancestry from the leaf to the root and returns the deepest
+// queue at which ssn.Allocatable refuses the task: the quota plugin, called with an ancestor of the
+// task's queue, checks that queue and above. Nil when no queue on the path refuses.
+func deepestBlocker(ssn *framework.Session, queue *api.QueueInfo, task *api.TaskInfo) *api.QueueInfo {
+	var blocker *api.QueueInfo
+	for q := queue; q != nil; {
+		if !ssn.Allocatable(q, task) {
+			blocker = q
+		}
+		parent := q.Queue.Spec.Parent
+		if parent == "" || parent == q.Name {
+			break
+		}
+		q = ssn.Queues[api.QueueID(parent)]
+	}
+	return blocker
+}
+
+// isUnder reports whether queueID is ancestorID or lies in its subtree, by the queues' parent
+// fields.
+func isUnder(ssn *framework.Session, queueID, ancestorID api.QueueID) bool {
+	for q := ssn.Queues[queueID]; q != nil; {
+		if q.UID == ancestorID {
+			return true
+		}
+		parent := q.Queue.Spec.Parent
+		if parent == "" || parent == q.Name {
+			return false
+		}
+		q = ssn.Queues[api.QueueID(parent)]
+	}
+	return false
+}
+
+// reclaimeesEverywhere lists the Running, preemptable tasks on every node that belong to another,
+// reclaimable queue than job's: the candidates of the quota round, ordered cheapest first.
+func reclaimeesEverywhere(ssn *framework.Session, job *api.JobInfo, task *api.TaskInfo) []*api.TaskInfo {
+	var all []*api.TaskInfo
+	for _, node := range ssn.Nodes {
+		all = append(all, reclaimeesOnNode(ssn, job, task, node)...)
+	}
+	if len(all) < 2 {
+		return all
+	}
+	ordered := make([]*api.TaskInfo, 0, len(all))
+	for q := ssn.BuildVictimsPriorityQueue(all, task); !q.Empty(); {
+		ordered = append(ordered, q.Pop().(*api.TaskInfo))
+	}
+	return ordered
 }
 
 func (ra *Action) UnInitialize() {

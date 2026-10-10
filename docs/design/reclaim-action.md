@@ -112,10 +112,12 @@ truly must not move; because it is user-settable and no queue setting overrides 
 labels everything never returns borrowed capacity, so it should not be grantable to users.
 PriorityClasses are cluster-scoped and can be capped per namespace with a ResourceQuota scope.
 
-Out of scope for this selection: the cost is per node, so it does not combine victims from several
-Out of scope for this selection: the cost is per node, so it does not combine victims from several
-nodes to free a queue's quota. Across sessions the freed room is held by the allocate action's
-reserved-ask pass (below), which is why `allocate` must stay ahead of `reclaim` in the action list.
+The cost is per node. Freeing a queue's quota with victims from several nodes is the quota round,
+`crossNodeVictims`, described in [quota-aware-reclaim.md](quota-aware-reclaim.md): with it the node
+round stops at the physical fit and the hierarchy is relieved with the cheapest admissible victims
+under the blocking ancestor, wherever they run, and a plan's victims and cost are the union of both
+rounds. Across sessions the freed room is held by the allocate action's reserved-ask pass (below),
+which is why `allocate` must stay ahead of `reclaim` in the action list.
 
 Configuration:
 
@@ -126,6 +128,8 @@ configurations:
     arguments:
       victimSelection: bestFit   # firstFit (default) or bestFit
       maxCandidateNodes: 0       # bestFit only; 0 explores every candidate node
+      crossNodeVictims: false    # the quota round; needs the quota plugin for ancestor blockers
+      maxCrossNodeVictims: 0     # quota round only; 0 = unbounded
 ```
 
 ## Waiting on the nominated node
